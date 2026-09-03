@@ -131,9 +131,6 @@ pub fn search(translation: &str, query: &str) -> Vec<SearchResult> {
                         text: verse.text.clone(),
                         translation: translation.to_uppercase(),
                     });
-                    if results.len() >= 50 {
-                        return results;
-                    }
                 }
             }
         }

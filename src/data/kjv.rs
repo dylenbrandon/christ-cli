@@ -133,7 +133,13 @@ pub fn search(query: &str) -> Vec<SearchResult> {
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
 
-    for book in KJV.values() {
+    // Iterate in canonical Bible order (Genesis -> Revelation), not the
+    // arbitrary hash order `KJV.values()` would give, so results read
+    // top-to-bottom the way a reader expects.
+    for book_info in crate::data::books::BOOKS {
+        let Some(book) = find_book(book_info.name) else {
+            continue;
+        };
         for ch in &book.chapters {
             let chapter_num: u32 = match ch.chapter.parse() {
                 Ok(n) => n,
@@ -157,7 +163,6 @@ pub fn search(query: &str) -> Vec<SearchResult> {
         }
     }
 
-    results.truncate(50); // Limit results
     results
 }
 
@@ -180,5 +185,40 @@ pub fn random_verse() -> Verse {
         verse: v.verse.parse().unwrap_or(1),
         text: v.text.clone(),
         translation: "KJV".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_results_are_in_canonical_book_order() {
+        // "God" appears in both Genesis and Exodus; Genesis must come first
+        // even though HashMap iteration order would not guarantee that.
+        let results = search("God");
+        let genesis_idx = results.iter().position(|r| r.book == "Genesis");
+        let exodus_idx = results.iter().position(|r| r.book == "Exodus");
+        assert!(genesis_idx.is_some(), "expected at least one match in Genesis");
+        assert!(exodus_idx.is_some(), "expected at least one match in Exodus");
+        assert!(genesis_idx < exodus_idx, "Genesis results must come before Exodus results");
+    }
+
+    #[test]
+    fn search_results_are_not_truncated() {
+        // "Jesus" occurs far more than 50 times across the New Testament;
+        // every occurrence should come back, not just the first 50.
+        let results = search("Jesus");
+        assert!(
+            results.len() > 50,
+            "expected more than 50 matches for 'Jesus', got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn search_is_case_insensitive_and_matches_expected_verse() {
+        let results = search("in the beginning god created");
+        assert!(results.iter().any(|r| r.book == "Genesis" && r.chapter == 1 && r.verse == 1));
     }
 }
