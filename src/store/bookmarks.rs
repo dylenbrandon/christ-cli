@@ -1,0 +1,278 @@
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub translation: String,
+    pub book: String,
+    pub chapter: u32,
+    pub verse: u32,
+    /// Snapshot of the verse text at bookmark time, so the bookmark list
+    /// can render without re-fetching the chapter.
+    pub verse_text: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Unix timestamp (seconds), used for sorting the bookmark list.
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+fn bookmarks_path() -> Option<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "christ-cli")?;
+    Some(dirs.data_dir().join("bookmarks.json"))
+}
+
+/// Loads bookmarks from disk. Returns an empty list if the file doesn't
+/// exist yet, or can't be parsed (e.g. corrupted) — never panics.
+pub fn load() -> Vec<Bookmark> {
+    let Some(path) = bookmarks_path() else {
+        return Vec::new();
+    };
+
+    match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persists the given bookmarks to disk, overwriting any existing file.
+/// Callers are responsible for invoking this after mutating a `Vec<Bookmark>`
+/// via `add`/`remove`/`toggle`/`set_note` below — those functions only
+/// touch memory, so unit tests can exercise them without any filesystem
+/// dependency.
+pub fn save(bookmarks: &[Bookmark]) {
+    let Some(path) = bookmarks_path() else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Ok(json) = serde_json::to_string_pretty(bookmarks) {
+        let _ = fs::write(&path, json);
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn matches(b: &Bookmark, translation: &str, book: &str, chapter: u32, verse: u32) -> bool {
+    b.translation.eq_ignore_ascii_case(translation)
+        && b.book.eq_ignore_ascii_case(book)
+        && b.chapter == chapter
+        && b.verse == verse
+}
+
+pub fn is_bookmarked(
+    bookmarks: &[Bookmark],
+    translation: &str,
+    book: &str,
+    chapter: u32,
+    verse: u32,
+) -> bool {
+    bookmarks
+        .iter()
+        .any(|b| matches(b, translation, book, chapter, verse))
+}
+
+/// Adds a bookmark if one doesn't already exist for this exact
+/// verse+translation. Returns true if a new bookmark was added.
+pub fn add(
+    bookmarks: &mut Vec<Bookmark>,
+    translation: &str,
+    book: &str,
+    chapter: u32,
+    verse: u32,
+    verse_text: &str,
+) -> bool {
+    if is_bookmarked(bookmarks, translation, book, chapter, verse) {
+        return false;
+    }
+    bookmarks.push(Bookmark {
+        translation: translation.to_string(),
+        book: book.to_string(),
+        chapter,
+        verse,
+        verse_text: verse_text.to_string(),
+        note: None,
+        created_at: now_unix(),
+    });
+    true
+}
+
+/// Removes the bookmark for this verse+translation, if any exists.
+/// Returns true if a bookmark was removed.
+pub fn remove(
+    bookmarks: &mut Vec<Bookmark>,
+    translation: &str,
+    book: &str,
+    chapter: u32,
+    verse: u32,
+) -> bool {
+    let before = bookmarks.len();
+    bookmarks.retain(|b| !matches(b, translation, book, chapter, verse));
+    bookmarks.len() != before
+}
+
+/// Adds a bookmark if absent, removes it if present.
+/// Returns true if the verse is now bookmarked, false if it was just removed.
+pub fn toggle(
+    bookmarks: &mut Vec<Bookmark>,
+    translation: &str,
+    book: &str,
+    chapter: u32,
+    verse: u32,
+    verse_text: &str,
+) -> bool {
+    if is_bookmarked(bookmarks, translation, book, chapter, verse) {
+        remove(bookmarks, translation, book, chapter, verse);
+        false
+    } else {
+        add(bookmarks, translation, book, chapter, verse, verse_text);
+        true
+    }
+}
+
+/// Sets (or clears, if `note` is `None` or blank) the note on a bookmark,
+/// creating the bookmark first if it doesn't already exist.
+pub fn set_note(
+    bookmarks: &mut Vec<Bookmark>,
+    translation: &str,
+    book: &str,
+    chapter: u32,
+    verse: u32,
+    verse_text: &str,
+    note: Option<String>,
+) {
+    if !is_bookmarked(bookmarks, translation, book, chapter, verse) {
+        add(bookmarks, translation, book, chapter, verse, verse_text);
+    }
+    if let Some(b) = bookmarks
+        .iter_mut()
+        .find(|b| matches(b, translation, book, chapter, verse))
+    {
+        b.note = note.filter(|n| !n.trim().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> (&'static str, &'static str, u32, u32, &'static str) {
+        (
+            "KJV",
+            "Genesis",
+            1,
+            1,
+            "In the beginning God created the heaven and the earth.",
+        )
+    }
+
+    #[test]
+    fn add_then_is_bookmarked() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, text) = sample();
+        assert!(!is_bookmarked(&bookmarks, t, b, c, v));
+        let added = add(&mut bookmarks, t, b, c, v, text);
+        assert!(added);
+        assert!(is_bookmarked(&bookmarks, t, b, c, v));
+        assert_eq!(bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn adding_twice_does_not_duplicate() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, text) = sample();
+        add(&mut bookmarks, t, b, c, v, text);
+        let added_again = add(&mut bookmarks, t, b, c, v, text);
+        assert!(!added_again);
+        assert_eq!(bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn remove_deletes_matching_bookmark() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, text) = sample();
+        add(&mut bookmarks, t, b, c, v, text);
+        let removed = remove(&mut bookmarks, t, b, c, v);
+        assert!(removed);
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn removing_nonexistent_bookmark_is_a_no_op() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, _text) = sample();
+        assert!(!remove(&mut bookmarks, t, b, c, v));
+    }
+
+    #[test]
+    fn toggle_flips_state_each_call() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, text) = sample();
+        assert!(toggle(&mut bookmarks, t, b, c, v, text)); // now bookmarked
+        assert!(!toggle(&mut bookmarks, t, b, c, v, text)); // now removed
+        assert!(bookmarks.is_empty());
+    }
+
+    #[test]
+    fn different_translations_are_independent_bookmarks() {
+        let mut bookmarks = Vec::new();
+        add(&mut bookmarks, "KJV", "Genesis", 1, 1, "text");
+        add(&mut bookmarks, "WEB", "Genesis", 1, 1, "text");
+        assert_eq!(bookmarks.len(), 2);
+    }
+
+    #[test]
+    fn book_matching_is_case_insensitive() {
+        let mut bookmarks = Vec::new();
+        add(&mut bookmarks, "KJV", "genesis", 1, 1, "text");
+        assert!(is_bookmarked(&bookmarks, "kjv", "Genesis", 1, 1));
+    }
+
+    #[test]
+    fn set_note_creates_bookmark_if_missing_and_stores_note() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, text) = sample();
+        set_note(
+            &mut bookmarks,
+            t,
+            b,
+            c,
+            v,
+            text,
+            Some("Key verse".to_string()),
+        );
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].note.as_deref(), Some("Key verse"));
+    }
+
+    #[test]
+    fn set_note_with_blank_string_clears_note() {
+        let mut bookmarks = Vec::new();
+        let (t, b, c, v, text) = sample();
+        set_note(&mut bookmarks, t, b, c, v, text, Some("temp".to_string()));
+        set_note(&mut bookmarks, t, b, c, v, text, Some("   ".to_string()));
+        assert!(bookmarks[0].note.is_none());
+    }
+
+    #[test]
+    fn legacy_bookmark_without_note_or_timestamp_deserializes() {
+        // Guards against the exact SessionState pitfall from earlier in
+        // this codebase: new fields must have serde defaults, or old
+        // bookmark files fail to load after an upgrade.
+        let legacy = r#"{"translation":"KJV","book":"Genesis","chapter":1,"verse":1,"verse_text":"..."}"#;
+        let bm: Bookmark = serde_json::from_str(legacy).unwrap();
+        assert!(bm.note.is_none());
+        assert_eq!(bm.created_at, 0);
+    }
+}

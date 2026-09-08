@@ -1,0 +1,522 @@
+diff --git a/src/app.rs b/src/app.rs
+index 2b22506..48695f6 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -428,6 +428,33 @@ impl App {
+                     return;
+                 }
+ 
++                // Compare-translation picker mode
++                if state.compare_picker {
++                    match key {
++                        KeyCode::Esc | KeyCode::Char('V') => {
++                            state.compare_picker = false;
++                        }
++                        KeyCode::Up | KeyCode::Char('k') => {
++                            let i = state.compare_translation_list.selected().unwrap_or(0);
++                            if i > 0 {
++                                state.compare_translation_list.select(Some(i - 1));
++                            }
++                        }
++                        KeyCode::Down | KeyCode::Char('j') => {
++                            let i = state.compare_translation_list.selected().unwrap_or(0);
++                            if i < TRANSLATIONS.len() - 1 {
++                                state.compare_translation_list.select(Some(i + 1));
++                            }
++                        }
++                        KeyCode::Enter => {
++                            state.pick_compare_translation();
++                            self.load_compare_chapter().await;
++                        }
++                        _ => {}
++                    }
++                    return;
++                }
++
+                 // Help overlay
+                 if state.help_open {
+                     match key {
+@@ -489,6 +516,9 @@ impl App {
+                     KeyCode::Char('n') => {
+                         self.open_note_for_current_verse();
+                     }
++                    KeyCode::Char('V') => {
++                        self.toggle_compare();
++                    }
+                     KeyCode::Char('y') | KeyCode::Char('c') => {
+                         self.copy_selection(false);
+                     }
+@@ -550,6 +580,17 @@ impl App {
+         }
+     }
+ 
++    /// Turn side-by-side comparison on (opens the picker) or off.
++    fn toggle_compare(&mut self) {
++        if let AppMode::Browser(ref mut state) = self.mode {
++            if state.compare_translation.is_some() {
++                state.close_compare();
++            } else {
++                state.open_compare_picker();
++            }
++        }
++    }
++
+     /// Open the note editor for the currently selected scripture-panel verse.
+     fn open_note_for_current_verse(&mut self) {
+         if let AppMode::Browser(ref mut state) = self.mode {
+@@ -764,16 +805,52 @@ impl App {
+ 
+             if let Some(ch) = api::get_chapter_sync(book, chapter, &translation) {
+                 Self::apply_loaded_chapter(state, ch);
++            } else {
++                state.loading = true;
++
++                match self.resolver.get_chapter(book, chapter, &translation).await {
++                    Ok(ch) => Self::apply_loaded_chapter(state, ch),
++                    Err(e) => {
++                        state.error = Some(e);
++                        state.loading = false;
++                    }
++                }
++            }
++        }
++
++        self.load_compare_chapter().await;
++    }
++
++    /// Fetches the second (compare) translation's chapter, if compare mode
++    /// is active. Mirrors `load_chapter` but into `compare_chapter`/
++    /// `compare_loading`/`compare_error` instead of the primary fields, so
++    /// the two columns can be in different loading states independently.
++    async fn load_compare_chapter(&mut self) {
++        if let AppMode::Browser(ref mut state) = self.mode {
++            let Some(translation) = state.compare_translation.clone() else {
++                return;
++            };
++            let book = state.selected_book_name();
++            let chapter = state.selected_chapter;
++
++            if let Some(ch) = api::get_chapter_sync(book, chapter, &translation) {
++                state.compare_chapter = Some(ch);
++                state.compare_loading = false;
++                state.compare_error = None;
+                 return;
+             }
+ 
+-            state.loading = true;
++            state.compare_loading = true;
++            state.compare_error = None;
+ 
+             match self.resolver.get_chapter(book, chapter, &translation).await {
+-                Ok(ch) => Self::apply_loaded_chapter(state, ch),
++                Ok(ch) => {
++                    state.compare_chapter = Some(ch);
++                    state.compare_loading = false;
++                }
+                 Err(e) => {
+-                    state.error = Some(e);
+-                    state.loading = false;
++                    state.compare_error = Some(e);
++                    state.compare_loading = false;
+                 }
+             }
+         }
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index e06e92f..bc4dfd9 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -167,6 +167,14 @@ pub struct BrowserState {
+     pub bookmark_mode: BookmarkMode,
+     /// Open while the note-entry overlay is active; None otherwise.
+     pub note_editor: Option<NoteEditor>,
++    /// Side-by-side comparison: Some(code) when active, showing this
++    /// translation read-only alongside the primary one.
++    pub compare_translation: Option<String>,
++    pub compare_chapter: Option<Chapter>,
++    pub compare_loading: bool,
++    pub compare_error: Option<String>,
++    pub compare_picker: bool,
++    pub compare_translation_list: ListState,
+ }
+ 
+ /// How long Books/Chapters browsing must be still before the scripture
+@@ -276,6 +284,12 @@ impl BrowserState {
+             bookmarks: crate::store::bookmarks::load(),
+             bookmark_mode: BookmarkMode::Off,
+             note_editor: None,
++            compare_translation: None,
++            compare_chapter: None,
++            compare_loading: false,
++            compare_error: None,
++            compare_picker: false,
++            compare_translation_list: ListState::default(),
+         }
+     }
+ 
+@@ -741,6 +755,34 @@ impl BrowserState {
+         });
+     }
+ 
++    pub fn open_compare_picker(&mut self) {
++        let current = self.compare_translation.as_deref().unwrap_or(&self.translation);
++        let current_idx = TRANSLATIONS
++            .iter()
++            .position(|t| t.code.eq_ignore_ascii_case(current))
++            .unwrap_or(0);
++        self.compare_translation_list.select(Some(current_idx));
++        self.compare_picker = true;
++    }
++
++    /// Select the translation from the compare picker and turn compare
++    /// mode on. Forces verse-per-line view, since side-by-side alignment
++    /// only makes sense with per-verse rows.
++    pub fn pick_compare_translation(&mut self) {
++        let idx = self.compare_translation_list.selected().unwrap_or(0);
++        self.compare_translation = Some(TRANSLATIONS[idx].code.to_string());
++        self.compare_picker = false;
++        self.view_mode = ViewMode::VersePerLine;
++    }
++
++    pub fn close_compare(&mut self) {
++        self.compare_translation = None;
++        self.compare_chapter = None;
++        self.compare_loading = false;
++        self.compare_error = None;
++        self.compare_picker = false;
++    }
++
+     /// Navigate to a book and chapter from a search result.
+     pub fn jump_to_result(&mut self, book: &str, chapter: u32, verse: u32) {
+         // Find the book index
+@@ -805,16 +847,32 @@ pub fn render_browser(
+     // Three panels: the sidebars take what their content needs and the
+     // scripture panel gets everything else (#8) — percentages wasted huge
+     // sidebars on wide terminals and truncated localized names on narrow.
+-    let books_width = books_panel_width(state, main_and_status[0].width);
+-    let panels = Layout::horizontal([
+-        Constraint::Length(books_width), // Books: widest (localized) name
+-        Constraint::Length(10),          // Chapters: 3 digits + chrome
+-        Constraint::Min(0),              // Scripture: the rest
+-    ])
+-    .split(main_and_status[0]);
++    // While comparing translations side by side, the sidebars hide
++    // entirely so both columns get real reading width.
++    let compare_active = state.compare_translation.is_some()
++        && matches!(state.search, SearchMode::Off)
++        && !matches!(state.bookmark_mode, BookmarkMode::Active { .. });
++
++    let (panels, scripture_area) = if compare_active {
++        let p = Layout::horizontal([Constraint::Min(0)]).split(main_and_status[0]);
++        let area = p[0];
++        (p, area)
++    } else {
++        let books_width = books_panel_width(state, main_and_status[0].width);
++        let p = Layout::horizontal([
++            Constraint::Length(books_width), // Books: widest (localized) name
++            Constraint::Length(10),          // Chapters: 3 digits + chrome
++            Constraint::Min(0),              // Scripture: the rest
++        ])
++        .split(main_and_status[0]);
++        let area = p[2];
++        (p, area)
++    };
+ 
+-    render_books_panel(frame, panels[0], state, theme);
+-    render_chapters_panel(frame, panels[1], state, theme);
++    if !compare_active {
++        render_books_panel(frame, panels[0], state, theme);
++        render_chapters_panel(frame, panels[1], state, theme);
++    }
+ 
+     let translation = state.translation.clone();
+     let dl = state.download_progress();
+@@ -824,14 +882,20 @@ pub fn render_browser(
+         .map(|(msg, _)| msg.clone());
+ 
+     if has_search_input {
+-        render_search_results_panel(frame, panels[2], state, theme);
++        render_search_results_panel(frame, scripture_area, state, theme);
+         render_search_input(frame, main_and_status[1], state, theme);
+         render_status_bar(frame, main_and_status[2], theme, theme_name, &translation, dl, flash.as_deref());
+     } else if matches!(state.bookmark_mode, BookmarkMode::Active { .. }) {
+-        render_bookmark_list_panel(frame, panels[2], state, theme);
++        render_bookmark_list_panel(frame, scripture_area, state, theme);
++        render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
++    } else if compare_active {
++        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
++            .split(scripture_area);
++        render_scripture_panel(frame, cols[0], state, theme);
++        render_compare_column(frame, cols[1], state, theme);
+         render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
+     } else {
+-        render_scripture_panel(frame, panels[2], state, theme);
++        render_scripture_panel(frame, scripture_area, state, theme);
+         render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
+     }
+ 
+@@ -840,6 +904,11 @@ pub fn render_browser(
+         render_translation_picker(frame, area, state, theme);
+     }
+ 
++    // Compare-translation picker popup
++    if state.compare_picker {
++        render_compare_picker(frame, area, state, theme);
++    }
++
+     // Help overlay
+     if state.help_open {
+         render_help_popup(frame, area, state, theme);
+@@ -1037,6 +1106,99 @@ fn render_scripture_panel(frame: &mut Frame, area: Rect, state: &mut BrowserStat
+     }
+ }
+ 
++/// Read-only column showing a second translation alongside the primary
++/// scripture panel (Shift+V). Deliberately simpler than `render_verse_list`
++/// — no selection cursor, no bookmark marker, no wrap cache — since this
++/// column doesn't support any interaction of its own; it just follows the
++/// primary column's selected verse to stay roughly in sync while scrolling.
++fn render_compare_column(frame: &mut Frame, area: Rect, state: &BrowserState, theme: &Theme) {
++    let code = state.compare_translation.as_deref().unwrap_or("");
++    let title = if let Some(ch) = &state.compare_chapter {
++        format!(" {} \u{00b7} {} {} ", code, ch.book, ch.chapter)
++    } else {
++        format!(" {} ", code)
++    };
++    let block = Block::default()
++        .title(Span::styled(title, Style::default().fg(theme.accent_soft).bold()))
++        .borders(Borders::ALL)
++        .border_type(BorderType::Rounded)
++        .border_style(Style::default().fg(theme.border))
++        .padding(Padding::new(2, 2, 1, 1))
++        .style(Style::default().bg(theme.surface));
++
++    if state.compare_loading {
++        let p = Paragraph::new(Span::styled("Loading...", Style::default().fg(theme.text_dim)))
++            .block(block)
++            .alignment(Alignment::Center);
++        frame.render_widget(p, area);
++        return;
++    }
++
++    if let Some(err) = &state.compare_error {
++        let p = Paragraph::new(Span::styled(
++            format!("Error: {}", err),
++            Style::default().fg(theme.search_match),
++        ))
++        .block(block)
++        .wrap(Wrap { trim: true });
++        frame.render_widget(p, area);
++        return;
++    }
++
++    let Some(chapter) = &state.compare_chapter else {
++        frame.render_widget(Paragraph::new("").block(block), area);
++        return;
++    };
++
++    let inner = block.inner(area);
++    let num_w = 3usize;
++    let text_w = (inner.width as usize).saturating_sub(num_w).max(10);
++    let selected_verse_num = state
++        .current_chapter
++        .as_ref()
++        .and_then(|c| c.verses.get(state.selected_verse_idx()))
++        .map(|v| v.verse);
++
++    let mut lines: Vec<Line> = Vec::with_capacity(chapter.verses.len() * 2);
++    let mut target_line = 0usize;
++
++    for v in &chapter.verses {
++        if selected_verse_num == Some(v.verse) {
++            target_line = lines.len();
++        }
++        let is_selected = selected_verse_num == Some(v.verse);
++        let num_style = if is_selected {
++            Style::default().fg(theme.accent_soft).bold()
++        } else {
++            Style::default().fg(theme.text_muted)
++        };
++        let text_style = if is_selected {
++            Style::default().fg(theme.text).bg(theme.highlight_bg)
++        } else {
++            Style::default().fg(theme.text_dim)
++        };
++
++        let wrapped = wrap::wrap_text(&v.text, text_w);
++        for (li, seg) in wrapped.iter().enumerate() {
++            let num = if li == 0 {
++                format!("{:<width$}", v.verse, width = num_w)
++            } else {
++                " ".repeat(num_w)
++            };
++            lines.push(Line::from(vec![
++                Span::styled(num, num_style),
++                Span::styled(seg.clone(), text_style),
++            ]));
++        }
++    }
++
++    let visible_h = inner.height as usize;
++    let scroll_y = target_line.saturating_sub(visible_h / 2) as u16;
++
++    let paragraph = Paragraph::new(lines).block(block).scroll((scroll_y, 0));
++    frame.render_widget(paragraph, area);
++}
++
+ /// Verse-per-line view: a selectable list with one (wrapped) verse per item,
+ /// a cursor arrow like the Books/Chapters panels, and visual-range styling.
+ fn render_verse_list(frame: &mut Frame, area: Rect, block: Block, state: &mut BrowserState, theme: &Theme) {
+@@ -1725,6 +1887,100 @@ fn truncate_display_name(name: &str, max_width: usize) -> String {
+     truncated
+ }
+ 
++/// Picker for the second (compare) translation, opened with Shift+V.
++/// Adapted from `render_translation_picker` — same layout, but tracks
++/// `compare_translation_list`/`compare_translation` instead of the
++/// primary translation picker's state.
++fn render_compare_picker(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
++    let mut lines: Vec<Line> = Vec::new();
++    let mut last_lang = "";
++    let mut selected_display_row: u16 = 0;
++
++    for (i, t) in TRANSLATIONS.iter().enumerate() {
++        if t.lang != last_lang {
++            if !last_lang.is_empty() {
++                lines.push(Line::default());
++            }
++            lines.push(Line::from(Span::styled(
++                format!("  {}", t.lang),
++                Style::default().fg(theme.text_muted).add_modifier(Modifier::BOLD),
++            )));
++            last_lang = t.lang;
++        }
++
++        if Some(i) == state.compare_translation_list.selected() {
++            selected_display_row = lines.len() as u16;
++        }
++
++        let is_selected = Some(i) == state.compare_translation_list.selected();
++        let is_current = state
++            .compare_translation
++            .as_deref()
++            .is_some_and(|c| t.code.eq_ignore_ascii_case(c));
++        let style = if is_selected {
++            Style::default()
++                .fg(theme.accent)
++                .bg(theme.highlight_bg)
++                .add_modifier(Modifier::BOLD)
++        } else if is_current {
++            Style::default().fg(theme.accent_soft).bold()
++        } else {
++            Style::default().fg(theme.text)
++        };
++
++        let prefix = if is_selected { " \u{25b8} " } else { "   " };
++        let suffix = if t.offline || cache::is_fully_cached(t.code) {
++            " (offline)"
++        } else if cache::has_cached_data(t.code) {
++            " (cached)"
++        } else {
++            ""
++        };
++        let marker = if is_current { " \u{2713}" } else { "" };
++        lines.push(Line::from(vec![
++            Span::styled(prefix.to_string(), style),
++            Span::styled(format!("{:<8}", t.code), style),
++            Span::styled(t.name.to_string(), style),
++            Span::styled(suffix.to_string(), Style::default().fg(theme.text_muted)),
++            Span::styled(marker.to_string(), Style::default().fg(theme.search_match).bold()),
++        ]));
++    }
++
++    let popup_width = 54u16;
++    let popup_height = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
++
++    let horizontal = Layout::horizontal([Constraint::Length(popup_width)])
++        .flex(Flex::Center)
++        .split(area);
++    let vertical = Layout::vertical([Constraint::Length(popup_height)])
++        .flex(Flex::Center)
++        .split(horizontal[0]);
++    let popup_area = vertical[0];
++
++    frame.render_widget(Clear, popup_area);
++
++    let block = Block::default()
++        .title(Span::styled(
++            " Compare With ",
++            Style::default().fg(theme.accent).bold(),
++        ))
++        .borders(Borders::ALL)
++        .border_type(BorderType::Rounded)
++        .border_style(Style::default().fg(theme.border_active))
++        .padding(Padding::horizontal(1))
++        .style(Style::default().bg(theme.surface));
++
++    let inner_height = block.inner(popup_area).height;
++    let scroll = if selected_display_row >= inner_height {
++        selected_display_row.saturating_sub(inner_height / 2)
++    } else {
++        0
++    };
++
++    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
++    frame.render_widget(paragraph, popup_area);
++}
++
+ fn render_translation_picker(
+     frame: &mut Frame,
+     area: Rect,
+@@ -1920,6 +2176,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &mut BrowserState, th
+         section("Settings"),
+         key_line("t", "cycle themes"),
+         key_line("v", "choose translation (Enter applies)"),
++        key_line("Shift+V", "compare a second translation side by side (read-only)"),
+         Line::default(),
+         section("Other"),
+         key_line("?", "toggle this help"),
+@@ -2446,4 +2703,44 @@ mod tests {
+         );
+         assert_eq!(s.note_editor.as_ref().unwrap().draft, "Key verse");
+     }
++
++    #[test]
++    fn open_compare_picker_defaults_to_primary_translation() {
++        let mut s = state_at(0, 1, 0);
++        s.translation = "NIV".to_string();
++        s.open_compare_picker();
++        let idx = s.compare_translation_list.selected().unwrap();
++        assert_eq!(TRANSLATIONS[idx].code, "NIV");
++    }
++
++    #[test]
++    fn pick_compare_translation_activates_compare_and_forces_verse_per_line() {
++        let mut s = state_at(0, 1, 0);
++        s.view_mode = ViewMode::Paragraph;
++        s.open_compare_picker();
++        let esv_idx = TRANSLATIONS.iter().position(|t| t.code == "ESV").unwrap();
++        s.compare_translation_list.select(Some(esv_idx));
++
++        s.pick_compare_translation();
++
++        assert_eq!(s.compare_translation.as_deref(), Some("ESV"));
++        assert!(!s.compare_picker);
++        assert_eq!(s.view_mode, ViewMode::VersePerLine);
++    }
++
++    #[test]
++    fn close_compare_clears_all_compare_state() {
++        let mut s = state_at(0, 1, 0);
++        s.open_compare_picker();
++        s.pick_compare_translation();
++        assert!(s.compare_translation.is_some());
++
++        s.close_compare();
++
++        assert!(s.compare_translation.is_none());
++        assert!(s.compare_chapter.is_none());
++        assert!(!s.compare_loading);
++        assert!(s.compare_error.is_none());
++        assert!(!s.compare_picker);
++    }
+ }

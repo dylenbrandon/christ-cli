@@ -1,5 +1,6 @@
 use crate::api::types::{Chapter, SearchResult};
 use crate::data::books::BOOKS;
+use crate::store::bookmarks::Bookmark;
 use crate::store::cache;
 use crate::ui::theme::{Theme, ThemeName};
 use crate::ui::wrap;
@@ -43,6 +44,24 @@ pub enum SearchMode {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BookmarkMode {
+    Off,
+    Active { list_state: ListState },
+}
+
+/// State for the note-entry overlay (`n`), opened either from the
+/// scripture panel or from within the bookmark list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteEditor {
+    pub translation: String,
+    pub book: String,
+    pub chapter: u32,
+    pub verse: u32,
+    pub verse_text: String,
+    pub draft: String,
+}
+
 pub struct TranslationInfo {
     pub code: &'static str,
     pub name: &'static str,
@@ -55,6 +74,7 @@ pub const TRANSLATIONS: &[TranslationInfo] = &[
     TranslationInfo { code: "KJV", name: "King James Version", lang: "English", offline: true },
     TranslationInfo { code: "WEB", name: "World English Bible", lang: "English", offline: false },
     TranslationInfo { code: "NKJV", name: "New King James Version", lang: "English", offline: false },
+    TranslationInfo { code: "MEV", name: "Modern English Version", lang: "English", offline: false },
     TranslationInfo { code: "ESV", name: "English Standard Version", lang: "English", offline: false },
     TranslationInfo { code: "NIV", name: "New International Version", lang: "English", offline: false },
     TranslationInfo { code: "NLT", name: "New Living Translation", lang: "English", offline: false },
@@ -140,6 +160,21 @@ pub struct BrowserState {
     /// the highlighted target after a short debounce (#7).
     pub preview_pending: Option<std::time::Instant>,
     verse_layout: VerseLayoutCache,
+    /// Saved bookmarks, loaded from disk at startup.
+    pub bookmarks: Vec<Bookmark>,
+    /// Whether the bookmark list is currently displayed in place of the
+    /// scripture panel (mirrors `SearchMode`).
+    pub bookmark_mode: BookmarkMode,
+    /// Open while the note-entry overlay is active; None otherwise.
+    pub note_editor: Option<NoteEditor>,
+    /// Side-by-side comparison: Some(code) when active, showing this
+    /// translation read-only alongside the primary one.
+    pub compare_translation: Option<String>,
+    pub compare_chapter: Option<Chapter>,
+    pub compare_loading: bool,
+    pub compare_error: Option<String>,
+    pub compare_picker: bool,
+    pub compare_translation_list: ListState,
 }
 
 /// How long Books/Chapters browsing must be still before the scripture
@@ -246,6 +281,15 @@ impl BrowserState {
             help_scroll: 0,
             preview_pending: None,
             verse_layout: VerseLayoutCache::default(),
+            bookmarks: crate::store::bookmarks::load(),
+            bookmark_mode: BookmarkMode::Off,
+            note_editor: None,
+            compare_translation: None,
+            compare_chapter: None,
+            compare_loading: false,
+            compare_error: None,
+            compare_picker: false,
+            compare_translation_list: ListState::default(),
         }
     }
 
@@ -641,6 +685,104 @@ impl BrowserState {
         }
     }
 
+    /// (translation, book, chapter, verse, verse_text) for the currently
+    /// selected verse in the scripture panel — the target of `b` (toggle
+    /// bookmark) and `n` (edit note). None if no chapter is loaded.
+    pub fn bookmark_target(&self) -> Option<(String, String, u32, u32, String)> {
+        let chapter = self.current_chapter.as_ref()?;
+        if chapter.verses.is_empty() {
+            return None;
+        }
+        let idx = self.selected_verse_idx();
+        let v = chapter.verses.get(idx)?;
+        Some((
+            chapter.translation.clone(),
+            chapter.book.clone(),
+            chapter.chapter,
+            v.verse,
+            v.text.clone(),
+        ))
+    }
+
+    /// Whether the currently selected scripture-panel verse is bookmarked.
+    pub fn current_verse_is_bookmarked(&self) -> bool {
+        match self.bookmark_target() {
+            Some((translation, book, chapter, verse, _text)) => {
+                crate::store::bookmarks::is_bookmarked(&self.bookmarks, &translation, &book, chapter, verse)
+            }
+            None => false,
+        }
+    }
+
+    pub fn selected_bookmark(&self) -> Option<&Bookmark> {
+        if let BookmarkMode::Active { list_state } = &self.bookmark_mode {
+            let idx = list_state.selected()?;
+            self.bookmarks.get(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Opens the note editor for a given verse, pre-filling the draft with
+    /// any note already saved on that verse's bookmark (if it exists).
+    pub fn open_note_editor(
+        &mut self,
+        translation: String,
+        book: String,
+        chapter: u32,
+        verse: u32,
+        verse_text: String,
+    ) {
+        let existing = self
+            .bookmarks
+            .iter()
+            .find(|b| {
+                b.translation.eq_ignore_ascii_case(&translation)
+                    && b.book.eq_ignore_ascii_case(&book)
+                    && b.chapter == chapter
+                    && b.verse == verse
+            })
+            .and_then(|b| b.note.clone())
+            .unwrap_or_default();
+
+        self.note_editor = Some(NoteEditor {
+            translation,
+            book,
+            chapter,
+            verse,
+            verse_text,
+            draft: existing,
+        });
+    }
+
+    pub fn open_compare_picker(&mut self) {
+        let current = self.compare_translation.as_deref().unwrap_or(&self.translation);
+        let current_idx = TRANSLATIONS
+            .iter()
+            .position(|t| t.code.eq_ignore_ascii_case(current))
+            .unwrap_or(0);
+        self.compare_translation_list.select(Some(current_idx));
+        self.compare_picker = true;
+    }
+
+    /// Select the translation from the compare picker and turn compare
+    /// mode on. Forces verse-per-line view, since side-by-side alignment
+    /// only makes sense with per-verse rows.
+    pub fn pick_compare_translation(&mut self) {
+        let idx = self.compare_translation_list.selected().unwrap_or(0);
+        self.compare_translation = Some(TRANSLATIONS[idx].code.to_string());
+        self.compare_picker = false;
+        self.view_mode = ViewMode::VersePerLine;
+    }
+
+    pub fn close_compare(&mut self) {
+        self.compare_translation = None;
+        self.compare_chapter = None;
+        self.compare_loading = false;
+        self.compare_error = None;
+        self.compare_picker = false;
+    }
+
     /// Navigate to a book and chapter from a search result.
     pub fn jump_to_result(&mut self, book: &str, chapter: u32, verse: u32) {
         // Find the book index
@@ -652,6 +794,7 @@ impl BrowserState {
             self.scripture_scroll = 0;
             self.active_panel = Panel::Scripture;
             self.search = SearchMode::Off;
+            self.bookmark_mode = BookmarkMode::Off;
             self.highlight_verse = Some(verse);
             // Approximate until the chapter loads; load_chapter re-resolves
             // by verse number (translations can have numbering gaps).
@@ -704,16 +847,32 @@ pub fn render_browser(
     // Three panels: the sidebars take what their content needs and the
     // scripture panel gets everything else (#8) — percentages wasted huge
     // sidebars on wide terminals and truncated localized names on narrow.
-    let books_width = books_panel_width(state, main_and_status[0].width);
-    let panels = Layout::horizontal([
-        Constraint::Length(books_width), // Books: widest (localized) name
-        Constraint::Length(10),          // Chapters: 3 digits + chrome
-        Constraint::Min(0),              // Scripture: the rest
-    ])
-    .split(main_and_status[0]);
+    // While comparing translations side by side, the sidebars hide
+    // entirely so both columns get real reading width.
+    let compare_active = state.compare_translation.is_some()
+        && matches!(state.search, SearchMode::Off)
+        && !matches!(state.bookmark_mode, BookmarkMode::Active { .. });
 
-    render_books_panel(frame, panels[0], state, theme);
-    render_chapters_panel(frame, panels[1], state, theme);
+    let (panels, scripture_area) = if compare_active {
+        let p = Layout::horizontal([Constraint::Min(0)]).split(main_and_status[0]);
+        let area = p[0];
+        (p, area)
+    } else {
+        let books_width = books_panel_width(state, main_and_status[0].width);
+        let p = Layout::horizontal([
+            Constraint::Length(books_width), // Books: widest (localized) name
+            Constraint::Length(10),          // Chapters: 3 digits + chrome
+            Constraint::Min(0),              // Scripture: the rest
+        ])
+        .split(main_and_status[0]);
+        let area = p[2];
+        (p, area)
+    };
+
+    if !compare_active {
+        render_books_panel(frame, panels[0], state, theme);
+        render_chapters_panel(frame, panels[1], state, theme);
+    }
 
     let translation = state.translation.clone();
     let dl = state.download_progress();
@@ -723,11 +882,20 @@ pub fn render_browser(
         .map(|(msg, _)| msg.clone());
 
     if has_search_input {
-        render_search_results_panel(frame, panels[2], state, theme);
+        render_search_results_panel(frame, scripture_area, state, theme);
         render_search_input(frame, main_and_status[1], state, theme);
         render_status_bar(frame, main_and_status[2], theme, theme_name, &translation, dl, flash.as_deref());
+    } else if matches!(state.bookmark_mode, BookmarkMode::Active { .. }) {
+        render_bookmark_list_panel(frame, scripture_area, state, theme);
+        render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
+    } else if compare_active {
+        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(scripture_area);
+        render_scripture_panel(frame, cols[0], state, theme);
+        render_compare_column(frame, cols[1], state, theme);
+        render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
     } else {
-        render_scripture_panel(frame, panels[2], state, theme);
+        render_scripture_panel(frame, scripture_area, state, theme);
         render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
     }
 
@@ -736,9 +904,20 @@ pub fn render_browser(
         render_translation_picker(frame, area, state, theme);
     }
 
+    // Compare-translation picker popup
+    if state.compare_picker {
+        render_compare_picker(frame, area, state, theme);
+    }
+
     // Help overlay
     if state.help_open {
         render_help_popup(frame, area, state, theme);
+    }
+
+    // Note editor popup — drawn last so it sits on top of everything,
+    // including the bookmark list it may have been opened from.
+    if state.note_editor.is_some() {
+        render_note_editor(frame, area, state, theme);
     }
 
     // Quit confirmation popup
@@ -768,7 +947,9 @@ fn books_panel_width(state: &BrowserState, total: u16) -> u16 {
 }
 
 fn render_books_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
-    let is_active = state.active_panel == Panel::Books && matches!(state.search, SearchMode::Off);
+    let is_active = state.active_panel == Panel::Books
+        && matches!(state.search, SearchMode::Off)
+        && matches!(state.bookmark_mode, BookmarkMode::Off);
     let block = Block::default()
         .title(Span::styled(
             " Books ",
@@ -808,7 +989,9 @@ fn render_books_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, t
 }
 
 fn render_chapters_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
-    let is_active = state.active_panel == Panel::Chapters && matches!(state.search, SearchMode::Off);
+    let is_active = state.active_panel == Panel::Chapters
+        && matches!(state.search, SearchMode::Off)
+        && matches!(state.bookmark_mode, BookmarkMode::Off);
     let block = Block::default()
         .title(Span::styled(
             " Ch ",
@@ -844,7 +1027,9 @@ fn render_chapters_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState
 }
 
 fn render_scripture_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
-    let is_active = state.active_panel == Panel::Scripture && matches!(state.search, SearchMode::Off);
+    let is_active = state.active_panel == Panel::Scripture
+        && matches!(state.search, SearchMode::Off)
+        && matches!(state.bookmark_mode, BookmarkMode::Off);
 
     let title = if let Some(ref ch) = state.current_chapter {
         format!(" {} {} ", state.loaded_book_display_name(ch), ch.chapter)
@@ -921,6 +1106,100 @@ fn render_scripture_panel(frame: &mut Frame, area: Rect, state: &mut BrowserStat
     }
 }
 
+/// Read-only column showing a second translation alongside the primary
+/// scripture panel (Shift+V). Deliberately simpler than `render_verse_list`
+/// — no selection cursor, no bookmark marker, no wrap cache — since this
+/// column doesn't support any interaction of its own; it just follows the
+/// primary column's selected verse to stay roughly in sync while scrolling.
+fn render_compare_column(frame: &mut Frame, area: Rect, state: &BrowserState, theme: &Theme) {
+    let code = state.compare_translation.as_deref().unwrap_or("");
+    let title = if let Some(ch) = &state.compare_chapter {
+        format!(" {} \u{00b7} {} {} ", code, ch.book, ch.chapter)
+    } else {
+        format!(" {} ", code)
+    };
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().fg(theme.accent_soft).bold()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .padding(Padding::new(2, 2, 1, 1))
+        .style(Style::default().bg(theme.surface));
+
+    if state.compare_loading {
+        let p = Paragraph::new(Span::styled("Loading...", Style::default().fg(theme.text_dim)))
+            .block(block)
+            .alignment(Alignment::Center);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    if let Some(err) = &state.compare_error {
+        let p = Paragraph::new(Span::styled(
+            format!("Error: {}", err),
+            Style::default().fg(theme.search_match),
+        ))
+        .block(block)
+        .wrap(Wrap { trim: true });
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let Some(chapter) = &state.compare_chapter else {
+        frame.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+
+    let inner = block.inner(area);
+    let num_w = 3usize;
+    let text_w = (inner.width as usize).saturating_sub(num_w).max(10);
+    let selected_verse_num = state
+        .current_chapter
+        .as_ref()
+        .and_then(|c| c.verses.get(state.selected_verse_idx()))
+        .map(|v| v.verse);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(chapter.verses.len() * 2);
+    let mut target_line = 0usize;
+
+    for v in &chapter.verses {
+        if selected_verse_num == Some(v.verse) {
+            target_line = lines.len();
+        }
+        let is_selected = selected_verse_num == Some(v.verse);
+        let num_style = if is_selected {
+            Style::default().fg(theme.accent_soft).bold()
+        } else {
+            Style::default().fg(theme.text_muted)
+        };
+        let text_style = if is_selected {
+            Style::default().fg(theme.text).bg(theme.highlight_bg)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+
+        let wrapped = wrap::wrap_text(&v.text, text_w);
+        for (li, seg) in wrapped.iter().enumerate() {
+            let num = if li == 0 {
+                format!("{:<width$}", v.verse, width = num_w)
+            } else {
+                " ".repeat(num_w)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(num, num_style),
+                Span::styled(seg.clone(), text_style),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+
+    let visible_h = inner.height as usize;
+    let scroll_y = target_line.saturating_sub(visible_h / 2) as u16;
+
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll_y, 0));
+    frame.render_widget(paragraph, area);
+}
+
 /// Verse-per-line view: a selectable list with one (wrapped) verse per item,
 /// a cursor arrow like the Books/Chapters panels, and visual-range styling.
 fn render_verse_list(frame: &mut Frame, area: Rect, block: Block, state: &mut BrowserState, theme: &Theme) {
@@ -956,7 +1235,8 @@ fn render_verse_list(frame: &mut Frame, area: Rect, block: Block, state: &mut Br
 
     let highlight = state.highlight_verse;
     let arrow_w = 2usize; // "▸ "
-    let text_w = (inner.width as usize).saturating_sub(arrow_w);
+    let marker_w = 2usize; // "★ "
+    let text_w = (inner.width as usize).saturating_sub(arrow_w).saturating_sub(marker_w);
 
     let chapter = state.current_chapter.as_ref().expect("chapter checked by caller");
     state.verse_layout.ensure(chapter, text_w as u16);
@@ -969,6 +1249,13 @@ fn render_verse_list(frame: &mut Frame, area: Rect, block: Block, state: &mut Br
         let is_selected = i == selected;
         let in_range = state.in_visual_range(i);
         let is_highlighted = highlight == Some(entry.verse);
+        let is_bookmarked = crate::store::bookmarks::is_bookmarked(
+            &state.bookmarks,
+            &chapter.translation,
+            &chapter.book,
+            chapter.chapter,
+            entry.verse,
+        );
 
         let (num_style, text_style) = if is_highlighted {
             (
@@ -976,14 +1263,21 @@ fn render_verse_list(frame: &mut Frame, area: Rect, block: Block, state: &mut Br
                 Style::default().fg(theme.search_match),
             )
         } else if is_selected {
+            let fg = if is_bookmarked { theme.bookmark } else { theme.accent };
             (
-                Style::default().fg(theme.accent).bg(theme.highlight_bg).bold(),
-                Style::default().fg(theme.text).bg(theme.highlight_bg),
+                Style::default().fg(fg).bg(theme.highlight_bg).bold(),
+                Style::default().fg(if is_bookmarked { theme.bookmark } else { theme.text }).bg(theme.highlight_bg),
             )
         } else if in_range {
+            let fg = if is_bookmarked { theme.bookmark } else { theme.accent_soft };
             (
-                Style::default().fg(theme.accent_soft).bg(theme.highlight_bg).bold(),
-                Style::default().fg(theme.text).bg(theme.highlight_bg),
+                Style::default().fg(fg).bg(theme.highlight_bg).bold(),
+                Style::default().fg(if is_bookmarked { theme.bookmark } else { theme.text }).bg(theme.highlight_bg),
+            )
+        } else if is_bookmarked {
+            (
+                Style::default().fg(theme.bookmark).bold(),
+                Style::default().fg(theme.bookmark),
             )
         } else {
             (
@@ -997,16 +1291,22 @@ fn render_verse_list(frame: &mut Frame, area: Rect, block: Block, state: &mut Br
         } else {
             Span::raw("  ")
         };
+        let marker = if is_bookmarked {
+            Span::styled("\u{2605} ", Style::default().fg(theme.bookmark))
+        } else {
+            Span::raw("  ")
+        };
 
         let mut lines: Vec<Line> = Vec::with_capacity(entry.wrapped.len() + 1);
         for (li, seg) in entry.wrapped.iter().enumerate() {
             let lead = if li == 0 { arrow.clone() } else { Span::raw("  ") };
+            let mark = if li == 0 { marker.clone() } else { Span::raw("  ") };
             let num_span = if li == 0 {
                 Span::styled(entry.num.clone(), num_style)
             } else {
                 Span::styled(" ".repeat(entry.num_w), num_style)
             };
-            lines.push(Line::from(vec![lead, num_span, Span::styled(seg.clone(), text_style)]));
+            lines.push(Line::from(vec![mark, lead, num_span, Span::styled(seg.clone(), text_style)]));
         }
         lines.push(Line::default());
 
@@ -1045,10 +1345,19 @@ fn render_paragraph_view(frame: &mut Frame, area: Rect, block: Block, state: &mu
     let mut spans: Vec<Span> = Vec::with_capacity(chapter.verses.len() * 3);
     for v in &chapter.verses {
         let is_highlighted = highlight == Some(v.verse);
+        let is_bookmarked = crate::store::bookmarks::is_bookmarked(
+            &state.bookmarks,
+            &chapter.translation,
+            &chapter.book,
+            chapter.chapter,
+            v.verse,
+        );
         spans.push(Span::styled(
             format!("{} ", v.verse),
             if is_highlighted {
                 Style::default().fg(theme.search_match).bold()
+            } else if is_bookmarked {
+                Style::default().fg(theme.bookmark).bold()
             } else {
                 Style::default().fg(theme.text_muted)
             },
@@ -1057,6 +1366,8 @@ fn render_paragraph_view(frame: &mut Frame, area: Rect, block: Block, state: &mu
             v.text.clone(),
             if is_highlighted {
                 Style::default().fg(theme.search_match)
+            } else if is_bookmarked {
+                Style::default().fg(theme.bookmark)
             } else {
                 Style::default().fg(theme.text)
             },
@@ -1216,11 +1527,36 @@ fn render_search_results_panel(
         .fg(theme.search_match)
         .add_modifier(Modifier::BOLD);
 
-    let items: Vec<ListItem> = results
+    // Only build ListItems for the rows actually on screen. With hundreds
+    // (or thousands) of results, formatting/truncating/highlighting text
+    // for every row on every frame is the real cost — not the search
+    // itself. Each row is a single Line (height 1), so we can replicate
+    // ratatui's own auto-scroll bookkeeping ourselves before slicing.
+    let total = results.len();
+    let list_area_height = chunks[0].height.saturating_sub(2) as usize; // minus top/bottom border
+    let selected = list_state.selected();
+
+    let mut offset = list_state.offset();
+    if let Some(sel) = selected {
+        if sel < offset {
+            offset = sel;
+        } else if list_area_height > 0 && sel >= offset + list_area_height {
+            offset = sel - list_area_height + 1;
+        }
+    }
+    let max_offset = total.saturating_sub(list_area_height);
+    offset = offset.min(max_offset);
+    *list_state.offset_mut() = offset;
+
+    let visible_end = (offset + list_area_height).min(total);
+    let visible_results = &results[offset..visible_end];
+
+    let items: Vec<ListItem> = visible_results
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let is_selected = Some(i) == list_state.selected();
+            let global_i = offset + i;
+            let is_selected = Some(global_i) == selected;
             let ref_style = if is_selected {
                 Style::default()
                     .fg(theme.accent)
@@ -1254,7 +1590,14 @@ fn render_search_results_panel(
         .collect();
 
     let list = List::new(items).block(block).highlight_symbol("  ");
-    frame.render_stateful_widget(list, chunks[0], list_state);
+    // `items` only contains the visible slice, so the widget needs a
+    // state whose selection/offset are relative to that slice, not the
+    // full result set.
+    let mut render_state = ListState::default();
+    if let Some(sel) = selected {
+        render_state.select(Some(sel.saturating_sub(offset)));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut render_state);
 
     // Full-text preview of the selected result (word-wrapped, no truncation).
     if let Some(r) = selected_result {
@@ -1280,6 +1623,149 @@ fn render_search_results_panel(
             let preview = Paragraph::new(Line::from(spans))
                 .block(preview_block)
                 .wrap(Wrap { trim: false });
+            frame.render_widget(preview, chunks[1]);
+        }
+    }
+}
+
+fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
+    let selected_bookmark = state.selected_bookmark().cloned();
+    let list_state = match &mut state.bookmark_mode {
+        BookmarkMode::Active { list_state } => list_state,
+        BookmarkMode::Off => return,
+    };
+    let bookmarks = &state.bookmarks;
+
+    let title = format!(" Bookmarks ({}) ", bookmarks.len());
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().fg(theme.accent).bold()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_active))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(theme.surface));
+
+    if bookmarks.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::default(),
+            Line::default(),
+            Line::from(Span::styled(
+                "No bookmarks yet",
+                Style::default().fg(theme.text_dim),
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                "Press b on a verse to bookmark it \u{00b7} Esc to go back",
+                Style::default().fg(theme.text_muted),
+            )),
+        ])
+        .block(block)
+        .alignment(Alignment::Center);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    // Reserve the bottom of the panel for the full text (and note, if any)
+    // of the selected bookmark, sized to its wrapped height.
+    let preview_height = selected_bookmark.as_ref().map_or(0, |b| {
+        let text_w = (area.width as usize).saturating_sub(4).max(10);
+        let note_lines = if b.note.is_some() { 2 } else { 0 };
+        (wrap::wrapped_height(&b.verse_text, text_w) as u16 + note_lines + 2).min(area.height / 2)
+    });
+    let chunks = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(preview_height),
+    ])
+    .split(area);
+
+    // Same windowing approach as the search results panel (#12 follow-up):
+    // only build ListItems for the rows actually on screen.
+    let total = bookmarks.len();
+    let list_area_height = chunks[0].height.saturating_sub(2) as usize;
+    let selected = list_state.selected();
+
+    let mut offset = list_state.offset();
+    if let Some(sel) = selected {
+        if sel < offset {
+            offset = sel;
+        } else if list_area_height > 0 && sel >= offset + list_area_height {
+            offset = sel - list_area_height + 1;
+        }
+    }
+    let max_offset = total.saturating_sub(list_area_height);
+    offset = offset.min(max_offset);
+    *list_state.offset_mut() = offset;
+
+    let visible_end = (offset + list_area_height).min(total);
+    let visible_bookmarks = &bookmarks[offset..visible_end];
+
+    let items: Vec<ListItem> = visible_bookmarks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let global_i = offset + i;
+            let is_selected = Some(global_i) == selected;
+            let ref_style = if is_selected {
+                Style::default()
+                    .fg(theme.bookmark)
+                    .bg(theme.highlight_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.bookmark).bold()
+            };
+            let text_style = if is_selected {
+                Style::default().fg(theme.bookmark).bg(theme.highlight_bg)
+            } else {
+                Style::default().fg(theme.bookmark)
+            };
+
+            let ref_str = format!("{} {}:{}", b.book, b.chapter, b.verse);
+            let note_marker = if b.note.is_some() { " [note]" } else { "" };
+            let chrome = 6 + UnicodeWidthStr::width(ref_str.as_str()) + note_marker.len();
+            let max_chars = (chunks[0].width as usize).saturating_sub(chrome).max(20);
+            let text = truncate_result_text(&b.verse_text, max_chars);
+
+            let spans = vec![
+                Span::styled(ref_str, ref_style),
+                Span::styled(note_marker, ref_style),
+                Span::styled("  ", text_style),
+                Span::styled(text, text_style),
+            ];
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items).block(block).highlight_symbol("  ");
+    let mut render_state = ListState::default();
+    if let Some(sel) = selected {
+        render_state.select(Some(sel.saturating_sub(offset)));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut render_state);
+
+    if let Some(b) = selected_bookmark {
+        if chunks[1].height >= 3 {
+            let preview_title = format!(" {} {}:{} \u{00b7} {} ", b.book, b.chapter, b.verse, b.translation);
+            let preview_block = Block::default()
+                .title(Span::styled(preview_title, Style::default().fg(theme.accent).bold()))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .padding(Padding::horizontal(1))
+                .style(Style::default().bg(theme.surface));
+
+            let mut lines = vec![Line::from(Span::styled(
+                b.verse_text.clone(),
+                Style::default().fg(theme.bookmark),
+            ))];
+            if let Some(note) = &b.note {
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::styled("Note: ", Style::default().fg(theme.accent_soft).bold()),
+                    Span::styled(note.clone(), Style::default().fg(theme.text_dim)),
+                ]));
+            }
+            let preview = Paragraph::new(lines).block(preview_block).wrap(Wrap { trim: false });
             frame.render_widget(preview, chunks[1]);
         }
     }
@@ -1339,6 +1825,7 @@ fn render_status_bar(
             ("\u{2190}\u{2192}/hl", "panels"),
             ("\u{2191}\u{2193}/jk", "navigate"),
             ("/", "search"),
+            ("b", "bookmark"),
             ("y/Y", "copy"),
             ("p", "view"),
             ("t", theme_name.label()),
@@ -1399,6 +1886,100 @@ fn truncate_display_name(name: &str, max_width: usize) -> String {
     }
     truncated.push('\u{2026}');
     truncated
+}
+
+/// Picker for the second (compare) translation, opened with Shift+V.
+/// Adapted from `render_translation_picker` — same layout, but tracks
+/// `compare_translation_list`/`compare_translation` instead of the
+/// primary translation picker's state.
+fn render_compare_picker(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut last_lang = "";
+    let mut selected_display_row: u16 = 0;
+
+    for (i, t) in TRANSLATIONS.iter().enumerate() {
+        if t.lang != last_lang {
+            if !last_lang.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", t.lang),
+                Style::default().fg(theme.text_muted).add_modifier(Modifier::BOLD),
+            )));
+            last_lang = t.lang;
+        }
+
+        if Some(i) == state.compare_translation_list.selected() {
+            selected_display_row = lines.len() as u16;
+        }
+
+        let is_selected = Some(i) == state.compare_translation_list.selected();
+        let is_current = state
+            .compare_translation
+            .as_deref()
+            .is_some_and(|c| t.code.eq_ignore_ascii_case(c));
+        let style = if is_selected {
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.highlight_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(theme.accent_soft).bold()
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        let prefix = if is_selected { " \u{25b8} " } else { "   " };
+        let suffix = if t.offline || cache::is_fully_cached(t.code) {
+            " (offline)"
+        } else if cache::has_cached_data(t.code) {
+            " (cached)"
+        } else {
+            ""
+        };
+        let marker = if is_current { " \u{2713}" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), style),
+            Span::styled(format!("{:<8}", t.code), style),
+            Span::styled(t.name.to_string(), style),
+            Span::styled(suffix.to_string(), Style::default().fg(theme.text_muted)),
+            Span::styled(marker.to_string(), Style::default().fg(theme.search_match).bold()),
+        ]));
+    }
+
+    let popup_width = 54u16;
+    let popup_height = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+
+    let horizontal = Layout::horizontal([Constraint::Length(popup_width)])
+        .flex(Flex::Center)
+        .split(area);
+    let vertical = Layout::vertical([Constraint::Length(popup_height)])
+        .flex(Flex::Center)
+        .split(horizontal[0]);
+    let popup_area = vertical[0];
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Compare With ",
+            Style::default().fg(theme.accent).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_active))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(theme.surface));
+
+    let inner_height = block.inner(popup_area).height;
+    let scroll = if selected_display_row >= inner_height {
+        selected_display_row.saturating_sub(inner_height / 2)
+    } else {
+        0
+    };
+
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn render_translation_picker(
@@ -1497,6 +2078,56 @@ fn render_translation_picker(
     frame.render_widget(paragraph, popup_area);
 }
 
+/// Single-line note entry overlay, opened with `n` from the scripture
+/// panel or the bookmark list. Modeled on `render_translation_picker`'s
+/// popup layout.
+fn render_note_editor(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
+    let Some(editor) = &state.note_editor else { return };
+
+    let verse_text_w = 50usize;
+    let verse_preview = truncate_result_text(&editor.verse_text, verse_text_w);
+
+    let popup_width = 56u16;
+    let popup_height = 8u16.min(area.height.saturating_sub(4));
+
+    let horizontal = Layout::horizontal([Constraint::Length(popup_width)])
+        .flex(Flex::Center)
+        .split(area);
+    let vertical = Layout::vertical([Constraint::Length(popup_height)])
+        .flex(Flex::Center)
+        .split(horizontal[0]);
+    let popup_area = vertical[0];
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" Note \u{00b7} {} {}:{} ", editor.book, editor.chapter, editor.verse);
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().fg(theme.bookmark).bold()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_active))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(theme.surface));
+
+    let lines = vec![
+        Line::from(Span::styled(verse_preview, Style::default().fg(theme.text_dim))),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent_soft).bold()),
+            Span::styled(editor.draft.clone(), Style::default().fg(theme.text)),
+            Span::styled("\u{2588}", Style::default().fg(theme.accent_soft)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "Enter save \u{00b7} Esc cancel",
+            Style::default().fg(theme.text_muted),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
 /// Full keybinding reference, opened with '?'.
 fn render_help_popup(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
     let key_style = Style::default().fg(theme.accent_soft).bold();
@@ -1536,9 +2167,17 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &mut BrowserState, th
         key_line("Enter", "jump to the selected verse"),
         key_line("Esc", "close search"),
         Line::default(),
+        section("Bookmarks"),
+        key_line("b", "bookmark / un-bookmark the selected verse"),
+        key_line("B", "open your bookmark list"),
+        key_line("n", "add / edit a note on the selected verse or bookmark"),
+        key_line("Enter", "jump to the selected bookmark"),
+        key_line("d", "delete the selected bookmark"),
+        Line::default(),
         section("Settings"),
         key_line("t", "cycle themes"),
         key_line("v", "choose translation (Enter applies)"),
+        key_line("Shift+V", "compare a second translation side by side (read-only)"),
         Line::default(),
         section("Other"),
         key_line("?", "toggle this help"),
@@ -1636,6 +2275,10 @@ mod tests {
 
     fn state_at(book_idx: usize, chapter: u32, scroll: u16) -> BrowserState {
         let mut s = BrowserState::new();
+        // BrowserState::new() loads real bookmarks from disk — reset so
+        // tests never depend on what happens to be saved on the machine
+        // running them.
+        s.bookmarks = Vec::new();
         s.selected_book_idx = book_idx;
         s.book_list.select(Some(book_idx));
         s.selected_chapter = chapter;
@@ -1713,6 +2356,16 @@ mod tests {
         assert!(codes.contains(&"NAA"), "NAA must be in the picker");
         assert!(codes.contains(&"ARA"), "ARA preserved");
         assert!(codes.contains(&"ACF11"));
+    }
+
+    #[test]
+    fn mev_is_available_as_an_english_translation() {
+        let mev = TRANSLATIONS
+            .iter()
+            .find(|t| t.code == "MEV")
+            .expect("MEV must be in the picker");
+        assert_eq!(mev.lang, "English");
+        assert_eq!(mev.name, "Modern English Version");
     }
 
     #[test]
@@ -1934,5 +2587,161 @@ mod tests {
         s.localized_books = vec!["Четверта книга Мойсеєва".to_string(); BOOKS.len()];
         assert_eq!(books_panel_width(&s, 60), 20);
         assert_eq!(books_panel_width(&s, 20), 12, "floor for tiny sizes");
+    }
+
+    #[test]
+    fn bookmark_target_reads_the_selected_verse() {
+        let mut s = state_at(0, 1, 0); // Genesis 1, stub verses 1-3
+        s.verse_list.select(Some(1)); // verse 2
+        let (translation, book, chapter, verse, text) = s.bookmark_target().unwrap();
+        assert_eq!(translation, "KJV");
+        assert_eq!(book, "Genesis");
+        assert_eq!(chapter, 1);
+        assert_eq!(verse, 2);
+        assert_eq!(text, "stub 2");
+    }
+
+    #[test]
+    fn bookmark_target_is_none_without_a_loaded_chapter() {
+        let s = BrowserState::new();
+        assert!(s.bookmark_target().is_none());
+    }
+
+    #[test]
+    fn current_verse_is_bookmarked_reflects_the_bookmarks_list() {
+        let mut s = state_at(0, 1, 0);
+        s.verse_list.select(Some(0)); // verse 1
+        assert!(!s.current_verse_is_bookmarked());
+
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
+        assert!(s.current_verse_is_bookmarked());
+
+        // A different verse in the same chapter is unaffected.
+        s.verse_list.select(Some(1)); // verse 2
+        assert!(!s.current_verse_is_bookmarked());
+    }
+
+    #[test]
+    fn selected_bookmark_tracks_the_bookmark_list_cursor() {
+        let mut s = state_at(0, 1, 0);
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2");
+
+        assert!(s.selected_bookmark().is_none(), "no cursor while bookmark_mode is Off");
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(1));
+        s.bookmark_mode = BookmarkMode::Active { list_state };
+        assert_eq!(s.selected_bookmark().unwrap().verse, 2);
+    }
+
+    #[test]
+    fn jump_to_result_closes_the_bookmark_list() {
+        let mut s = state_at(0, 1, 0);
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        s.bookmark_mode = BookmarkMode::Active { list_state };
+
+        s.jump_to_result("Exodus", 2, 3);
+        assert_eq!(s.bookmark_mode, BookmarkMode::Off);
+    }
+
+    #[test]
+    fn open_note_editor_starts_blank_when_no_note_exists() {
+        let mut s = state_at(0, 1, 0);
+        s.open_note_editor(
+            "KJV".to_string(),
+            "Genesis".to_string(),
+            1,
+            1,
+            "stub 1".to_string(),
+        );
+        let editor = s.note_editor.as_ref().unwrap();
+        assert_eq!(editor.draft, "");
+        assert_eq!(editor.verse, 1);
+    }
+
+    #[test]
+    fn open_note_editor_prefills_an_existing_note() {
+        let mut s = state_at(0, 1, 0);
+        crate::store::bookmarks::set_note(
+            &mut s.bookmarks,
+            "KJV",
+            "Genesis",
+            1,
+            1,
+            "stub 1",
+            Some("Key verse".to_string()),
+        );
+        s.open_note_editor(
+            "KJV".to_string(),
+            "Genesis".to_string(),
+            1,
+            1,
+            "stub 1".to_string(),
+        );
+        assert_eq!(s.note_editor.as_ref().unwrap().draft, "Key verse");
+    }
+
+    #[test]
+    fn open_note_editor_is_case_insensitive_on_book_and_translation() {
+        let mut s = state_at(0, 1, 0);
+        crate::store::bookmarks::set_note(
+            &mut s.bookmarks,
+            "KJV",
+            "Genesis",
+            1,
+            1,
+            "stub 1",
+            Some("Key verse".to_string()),
+        );
+        s.open_note_editor(
+            "kjv".to_string(),
+            "genesis".to_string(),
+            1,
+            1,
+            "stub 1".to_string(),
+        );
+        assert_eq!(s.note_editor.as_ref().unwrap().draft, "Key verse");
+    }
+
+    #[test]
+    fn open_compare_picker_defaults_to_primary_translation() {
+        let mut s = state_at(0, 1, 0);
+        s.translation = "NIV".to_string();
+        s.open_compare_picker();
+        let idx = s.compare_translation_list.selected().unwrap();
+        assert_eq!(TRANSLATIONS[idx].code, "NIV");
+    }
+
+    #[test]
+    fn pick_compare_translation_activates_compare_and_forces_verse_per_line() {
+        let mut s = state_at(0, 1, 0);
+        s.view_mode = ViewMode::Paragraph;
+        s.open_compare_picker();
+        let esv_idx = TRANSLATIONS.iter().position(|t| t.code == "ESV").unwrap();
+        s.compare_translation_list.select(Some(esv_idx));
+
+        s.pick_compare_translation();
+
+        assert_eq!(s.compare_translation.as_deref(), Some("ESV"));
+        assert!(!s.compare_picker);
+        assert_eq!(s.view_mode, ViewMode::VersePerLine);
+    }
+
+    #[test]
+    fn close_compare_clears_all_compare_state() {
+        let mut s = state_at(0, 1, 0);
+        s.open_compare_picker();
+        s.pick_compare_translation();
+        assert!(s.compare_translation.is_some());
+
+        s.close_compare();
+
+        assert!(s.compare_translation.is_none());
+        assert!(s.compare_chapter.is_none());
+        assert!(!s.compare_loading);
+        assert!(s.compare_error.is_none());
+        assert!(!s.compare_picker);
     }
 }

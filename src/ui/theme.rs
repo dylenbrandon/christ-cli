@@ -13,6 +13,10 @@ pub struct Theme {
     pub accent_soft: Color,
     pub highlight_bg: Color,
     pub search_match: Color,
+    /// Marker color for bookmarked verses in the scripture panel — kept
+    /// distinct from `search_match` since both can appear in the same
+    /// panel (a bookmarked verse you also just jumped to from search).
+    pub bookmark: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -75,6 +79,7 @@ const SLATE: Theme = Theme {
     accent_soft: Color::Rgb(203, 213, 225),// slate-300
     highlight_bg: Color::Rgb(55, 70, 95),  // slate-700 (boosted)
     search_match: Color::Rgb(251, 191, 36),// amber-400
+    bookmark: Color::Rgb(212, 175, 55),   // goldenrod
 };
 
 /// Midnight — shadcn/Vercel style, pure black, neutral grays, sharp contrast
@@ -90,6 +95,7 @@ const MIDNIGHT: Theme = Theme {
     accent_soft: Color::Rgb(212, 212, 212), // neutral-300
     highlight_bg: Color::Rgb(35, 35, 35), // neutral-800 (boosted)
     search_match: Color::Rgb(234, 179, 8),// yellow-500
+    bookmark: Color::Rgb(212, 175, 55),   // goldenrod
 };
 
 /// Parchment — warm cream/sepia tones, comfortable long reading
@@ -105,6 +111,7 @@ const PARCHMENT: Theme = Theme {
     accent_soft: Color::Rgb(100, 85, 60), // medium brown
     highlight_bg: Color::Rgb(210, 195, 160), // warm tan (high contrast)
     search_match: Color::Rgb(180, 100, 30), // warm orange
+    bookmark: Color::Rgb(150, 115, 20),   // dark goldenrod (contrast on cream)
 };
 
 /// Gospel — clean bright white, crisp and minimal
@@ -120,6 +127,7 @@ const GOSPEL: Theme = Theme {
     accent_soft: Color::Rgb(75, 85, 99),  // gray-600
     highlight_bg: Color::Rgb(220, 225, 235), // blue-gray (high contrast)
     search_match: Color::Rgb(217, 119, 6),// amber-600
+    bookmark: Color::Rgb(161, 121, 8),    // dark gold (contrast on white)
 };
 
 /// Terminal — transparent, uses the terminal's own background
@@ -135,4 +143,5 @@ const TERMINAL: Theme = Theme {
     accent_soft: Color::Rgb(203, 213, 225),// slate-300
     highlight_bg: Color::Rgb(55, 70, 95),  // slate-700
     search_match: Color::Rgb(251, 191, 36),// amber-400
+    bookmark: Color::Rgb(212, 175, 55),   // goldenrod
 };

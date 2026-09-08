@@ -1,0 +1,12 @@
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index bc4dfd9..87df34d 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -1190,6 +1190,7 @@ fn render_compare_column(frame: &mut Frame, area: Rect, state: &BrowserState, th
+                 Span::styled(seg.clone(), text_style),
+             ]));
+         }
++        lines.push(Line::default());
+     }
+ 
+     let visible_h = inner.height as usize;

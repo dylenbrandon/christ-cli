@@ -2,7 +2,7 @@ use crate::api::{self, Resolver};
 use crate::data::kjv;
 use crate::store::{cache, state as session};
 use crate::ui::banner::{self, BannerState};
-use crate::ui::browser::{self, BrowserState, SearchMode, TRANSLATIONS};
+use crate::ui::browser::{self, BookmarkMode, BrowserState, SearchMode, TRANSLATIONS};
 use crate::ui::theme::{self, ThemeName};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -113,6 +113,21 @@ impl App {
                         self.handle_key(key).await;
                     }
                 }
+                // Drain any events that piled up while we were busy (e.g.
+                // held-key repeat firing faster than a full draw can keep
+                // up with). Without this, input visibly "catches up" one
+                // stale frame at a time after you release the key, since
+                // every queued keystroke would otherwise get its own draw.
+                // Capped so a runaway input flood can't starve rendering.
+                let mut drained = 0;
+                while drained < 64 && event::poll(Duration::ZERO)? {
+                    if let Event::Key(key) = event::read()? {
+                        if key.kind == KeyEventKind::Press {
+                            self.handle_key(key).await;
+                        }
+                    }
+                    drained += 1;
+                }
             } else {
                 if let AppMode::Banner(ref mut state) = self.mode {
                     state.tick();
@@ -137,6 +152,7 @@ impl App {
                 self.mode,
                 AppMode::Browser(ref s) if s.preview_due()
                     && matches!(s.search, SearchMode::Off)
+                    && matches!(s.bookmark_mode, BookmarkMode::Off)
                     && !s.translation_picker
                     && !s.help_open
             );
@@ -215,6 +231,49 @@ impl App {
                 state.done = true;
             }
             AppMode::Browser(state) => {
+                // Note editor overlay — takes priority over every other
+                // mode, since it can be opened from either the scripture
+                // panel or the bookmark list.
+                if state.note_editor.is_some() {
+                    match key {
+                        KeyCode::Esc => {
+                            state.note_editor = None;
+                        }
+                        KeyCode::Enter => {
+                            if let Some(editor) = state.note_editor.take() {
+                                crate::store::bookmarks::set_note(
+                                    &mut state.bookmarks,
+                                    &editor.translation,
+                                    &editor.book,
+                                    editor.chapter,
+                                    editor.verse,
+                                    &editor.verse_text,
+                                    Some(editor.draft.clone()),
+                                );
+                                crate::store::bookmarks::save(&state.bookmarks);
+                                let msg = if editor.draft.trim().is_empty() {
+                                    "Note cleared"
+                                } else {
+                                    "Note saved"
+                                };
+                                state.flash(msg);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(editor) = &mut state.note_editor {
+                                editor.draft.pop();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(editor) = &mut state.note_editor {
+                                editor.draft.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 // Search mode
                 if matches!(state.search, SearchMode::Active { .. }) {
                     match key {
@@ -270,6 +329,74 @@ impl App {
                     return;
                 }
 
+                // Bookmark list mode
+                if matches!(state.bookmark_mode, BookmarkMode::Active { .. }) {
+                    match key {
+                        KeyCode::Esc | KeyCode::Char('B') => {
+                            state.bookmark_mode = BookmarkMode::Off;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
+                                let i = list_state.selected().unwrap_or(0);
+                                if i > 0 {
+                                    list_state.select(Some(i - 1));
+                                }
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
+                                let i = list_state.selected().unwrap_or(0);
+                                if i < state.bookmarks.len().saturating_sub(1) {
+                                    list_state.select(Some(i + 1));
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let target = state
+                                .selected_bookmark()
+                                .map(|b| (b.book.clone(), b.chapter, b.verse));
+                            if let Some((book, chapter, verse)) = target {
+                                state.jump_to_result(&book, chapter, verse);
+                                self.load_chapter().await;
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if let Some(b) = state.selected_bookmark().cloned() {
+                                crate::store::bookmarks::remove(
+                                    &mut state.bookmarks,
+                                    &b.translation,
+                                    &b.book,
+                                    b.chapter,
+                                    b.verse,
+                                );
+                                crate::store::bookmarks::save(&state.bookmarks);
+                                if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
+                                    let i = list_state.selected().unwrap_or(0);
+                                    list_state.select(Some(
+                                        i.min(state.bookmarks.len().saturating_sub(1)),
+                                    ));
+                                }
+                                if state.bookmarks.is_empty() {
+                                    state.bookmark_mode = BookmarkMode::Off;
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') => {
+                            if let Some(b) = state.selected_bookmark().cloned() {
+                                state.open_note_editor(
+                                    b.translation,
+                                    b.book,
+                                    b.chapter,
+                                    b.verse,
+                                    b.verse_text,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 // Translation picker mode
                 if state.translation_picker {
                     match key {
@@ -295,6 +422,33 @@ impl App {
                                 self.load_chapter().await;
                                 self.start_cache_download();
                             }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
+                // Compare-translation picker mode
+                if state.compare_picker {
+                    match key {
+                        KeyCode::Esc | KeyCode::Char('V') => {
+                            state.compare_picker = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let i = state.compare_translation_list.selected().unwrap_or(0);
+                            if i > 0 {
+                                state.compare_translation_list.select(Some(i - 1));
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let i = state.compare_translation_list.selected().unwrap_or(0);
+                            if i < TRANSLATIONS.len() - 1 {
+                                state.compare_translation_list.select(Some(i + 1));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            state.pick_compare_translation();
+                            self.load_compare_chapter().await;
                         }
                         _ => {}
                     }
@@ -353,6 +507,18 @@ impl App {
                         state.help_open = true;
                         state.help_scroll = 0;
                     }
+                    KeyCode::Char('b') => {
+                        self.toggle_bookmark();
+                    }
+                    KeyCode::Char('B') => {
+                        self.open_bookmark_list();
+                    }
+                    KeyCode::Char('n') => {
+                        self.open_note_for_current_verse();
+                    }
+                    KeyCode::Char('V') => {
+                        self.toggle_compare();
+                    }
                     KeyCode::Char('y') | KeyCode::Char('c') => {
                         self.copy_selection(false);
                     }
@@ -388,6 +554,63 @@ impl App {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Toggle a bookmark on the currently selected scripture-panel verse.
+    fn toggle_bookmark(&mut self) {
+        if let AppMode::Browser(ref mut state) = self.mode {
+            let Some((translation, book, chapter, verse, text)) = state.bookmark_target() else {
+                return;
+            };
+            let now_bookmarked = crate::store::bookmarks::toggle(
+                &mut state.bookmarks,
+                &translation,
+                &book,
+                chapter,
+                verse,
+                &text,
+            );
+            crate::store::bookmarks::save(&state.bookmarks);
+            if now_bookmarked {
+                state.flash("Bookmarked");
+            } else {
+                state.flash("Bookmark removed");
+            }
+        }
+    }
+
+    /// Turn side-by-side comparison on (opens the picker) or off.
+    fn toggle_compare(&mut self) {
+        if let AppMode::Browser(ref mut state) = self.mode {
+            if state.compare_translation.is_some() {
+                state.close_compare();
+            } else {
+                state.open_compare_picker();
+            }
+        }
+    }
+
+    /// Open the note editor for the currently selected scripture-panel verse.
+    fn open_note_for_current_verse(&mut self) {
+        if let AppMode::Browser(ref mut state) = self.mode {
+            let Some((translation, book, chapter, verse, text)) = state.bookmark_target() else {
+                return;
+            };
+            state.open_note_editor(translation, book, chapter, verse, text);
+        }
+    }
+
+    /// Open the bookmark list in place of the scripture panel.
+    fn open_bookmark_list(&mut self) {
+        if let AppMode::Browser(ref mut state) = self.mode {
+            if state.bookmarks.is_empty() {
+                state.flash("No bookmarks yet \u{2014} press b on a verse to add one");
+                return;
+            }
+            let mut list_state = ListState::default();
+            list_state.select(Some(0));
+            state.bookmark_mode = BookmarkMode::Active { list_state };
         }
     }
 
@@ -582,16 +805,52 @@ impl App {
 
             if let Some(ch) = api::get_chapter_sync(book, chapter, &translation) {
                 Self::apply_loaded_chapter(state, ch);
+            } else {
+                state.loading = true;
+
+                match self.resolver.get_chapter(book, chapter, &translation).await {
+                    Ok(ch) => Self::apply_loaded_chapter(state, ch),
+                    Err(e) => {
+                        state.error = Some(e);
+                        state.loading = false;
+                    }
+                }
+            }
+        }
+
+        self.load_compare_chapter().await;
+    }
+
+    /// Fetches the second (compare) translation's chapter, if compare mode
+    /// is active. Mirrors `load_chapter` but into `compare_chapter`/
+    /// `compare_loading`/`compare_error` instead of the primary fields, so
+    /// the two columns can be in different loading states independently.
+    async fn load_compare_chapter(&mut self) {
+        if let AppMode::Browser(ref mut state) = self.mode {
+            let Some(translation) = state.compare_translation.clone() else {
+                return;
+            };
+            let book = state.selected_book_name();
+            let chapter = state.selected_chapter;
+
+            if let Some(ch) = api::get_chapter_sync(book, chapter, &translation) {
+                state.compare_chapter = Some(ch);
+                state.compare_loading = false;
+                state.compare_error = None;
                 return;
             }
 
-            state.loading = true;
+            state.compare_loading = true;
+            state.compare_error = None;
 
             match self.resolver.get_chapter(book, chapter, &translation).await {
-                Ok(ch) => Self::apply_loaded_chapter(state, ch),
+                Ok(ch) => {
+                    state.compare_chapter = Some(ch);
+                    state.compare_loading = false;
+                }
                 Err(e) => {
-                    state.error = Some(e);
-                    state.loading = false;
+                    state.compare_error = Some(e);
+                    state.compare_loading = false;
                 }
             }
         }

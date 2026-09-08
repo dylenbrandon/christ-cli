@@ -1,0 +1,29 @@
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index 3bf9cb9..e06e92f 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -74,6 +74,7 @@ pub const TRANSLATIONS: &[TranslationInfo] = &[
+     TranslationInfo { code: "KJV", name: "King James Version", lang: "English", offline: true },
+     TranslationInfo { code: "WEB", name: "World English Bible", lang: "English", offline: false },
+     TranslationInfo { code: "NKJV", name: "New King James Version", lang: "English", offline: false },
++    TranslationInfo { code: "MEV", name: "Modern English Version", lang: "English", offline: false },
+     TranslationInfo { code: "ESV", name: "English Standard Version", lang: "English", offline: false },
+     TranslationInfo { code: "NIV", name: "New International Version", lang: "English", offline: false },
+     TranslationInfo { code: "NLT", name: "New Living Translation", lang: "English", offline: false },
+@@ -2099,6 +2100,16 @@ mod tests {
+         assert!(codes.contains(&"ACF11"));
+     }
+ 
++    #[test]
++    fn mev_is_available_as_an_english_translation() {
++        let mev = TRANSLATIONS
++            .iter()
++            .find(|t| t.code == "MEV")
++            .expect("MEV must be in the picker");
++        assert_eq!(mev.lang, "English");
++        assert_eq!(mev.name, "Modern English Version");
++    }
++
+     #[test]
+     fn ara_display_name_includes_year() {
+         let ara = TRANSLATIONS

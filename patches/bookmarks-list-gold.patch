@@ -1,0 +1,34 @@
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index ee7907b..fafcad2 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -1490,16 +1490,16 @@ fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut Browser
+             let is_selected = Some(global_i) == selected;
+             let ref_style = if is_selected {
+                 Style::default()
+-                    .fg(theme.accent)
++                    .fg(theme.bookmark)
+                     .bg(theme.highlight_bg)
+                     .add_modifier(Modifier::BOLD)
+             } else {
+-                Style::default().fg(theme.accent_soft).bold()
++                Style::default().fg(theme.bookmark).bold()
+             };
+             let text_style = if is_selected {
+-                Style::default().fg(theme.text).bg(theme.highlight_bg)
++                Style::default().fg(theme.bookmark).bg(theme.highlight_bg)
+             } else {
+-                Style::default().fg(theme.text_dim)
++                Style::default().fg(theme.bookmark)
+             };
+ 
+             let ref_str = format!("{} {}:{}", b.book, b.chapter, b.verse);
+@@ -1539,7 +1539,7 @@ fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut Browser
+ 
+             let mut lines = vec![Line::from(Span::styled(
+                 b.verse_text.clone(),
+-                Style::default().fg(theme.text),
++                Style::default().fg(theme.bookmark),
+             ))];
+             if let Some(note) = &b.note {
+                 lines.push(Line::default());

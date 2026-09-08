@@ -1,0 +1,13 @@
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index b9b276f..3bf9cb9 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -1556,7 +1556,7 @@ fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut Browser
+             };
+ 
+             let ref_str = format!("{} {}:{}", b.book, b.chapter, b.verse);
+-            let note_marker = if b.note.is_some() { " \u{1f4dd}" } else { "" };
++            let note_marker = if b.note.is_some() { " [note]" } else { "" };
+             let chrome = 6 + UnicodeWidthStr::width(ref_str.as_str()) + note_marker.len();
+             let max_chars = (chunks[0].width as usize).saturating_sub(chrome).max(20);
+             let text = truncate_result_text(&b.verse_text, max_chars);

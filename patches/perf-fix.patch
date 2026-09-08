@@ -1,0 +1,60 @@
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index 5d2682e..7403ce0 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -1216,11 +1216,36 @@ fn render_search_results_panel(
+         .fg(theme.search_match)
+         .add_modifier(Modifier::BOLD);
+ 
+-    let items: Vec<ListItem> = results
++    // Only build ListItems for the rows actually on screen. With hundreds
++    // (or thousands) of results, formatting/truncating/highlighting text
++    // for every row on every frame is the real cost — not the search
++    // itself. Each row is a single Line (height 1), so we can replicate
++    // ratatui's own auto-scroll bookkeeping ourselves before slicing.
++    let total = results.len();
++    let list_area_height = chunks[0].height.saturating_sub(2) as usize; // minus top/bottom border
++    let selected = list_state.selected();
++
++    let mut offset = list_state.offset();
++    if let Some(sel) = selected {
++        if sel < offset {
++            offset = sel;
++        } else if list_area_height > 0 && sel >= offset + list_area_height {
++            offset = sel - list_area_height + 1;
++        }
++    }
++    let max_offset = total.saturating_sub(list_area_height);
++    offset = offset.min(max_offset);
++    *list_state.offset_mut() = offset;
++
++    let visible_end = (offset + list_area_height).min(total);
++    let visible_results = &results[offset..visible_end];
++
++    let items: Vec<ListItem> = visible_results
+         .iter()
+         .enumerate()
+         .map(|(i, r)| {
+-            let is_selected = Some(i) == list_state.selected();
++            let global_i = offset + i;
++            let is_selected = Some(global_i) == selected;
+             let ref_style = if is_selected {
+                 Style::default()
+                     .fg(theme.accent)
+@@ -1254,7 +1279,14 @@ fn render_search_results_panel(
+         .collect();
+ 
+     let list = List::new(items).block(block).highlight_symbol("  ");
+-    frame.render_stateful_widget(list, chunks[0], list_state);
++    // `items` only contains the visible slice, so the widget needs a
++    // state whose selection/offset are relative to that slice, not the
++    // full result set.
++    let mut render_state = ListState::default();
++    if let Some(sel) = selected {
++        render_state.select(Some(sel.saturating_sub(offset)));
++    }
++    frame.render_stateful_widget(list, chunks[0], &mut render_state);
+ 
+     // Full-text preview of the selected result (word-wrapped, no truncation).
+     if let Some(r) = selected_result {
+

@@ -1,0 +1,526 @@
+diff --git a/src/app.rs b/src/app.rs
+index 5bdf8b5..56ed119 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -2,7 +2,7 @@ use crate::api::{self, Resolver};
+ use crate::data::kjv;
+ use crate::store::{cache, state as session};
+ use crate::ui::banner::{self, BannerState};
+-use crate::ui::browser::{self, BrowserState, SearchMode, TRANSLATIONS};
++use crate::ui::browser::{self, BookmarkMode, BrowserState, SearchMode, TRANSLATIONS};
+ use crate::ui::theme::{self, ThemeName};
+ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+ use ratatui::widgets::ListState;
+@@ -152,6 +152,7 @@ impl App {
+                 self.mode,
+                 AppMode::Browser(ref s) if s.preview_due()
+                     && matches!(s.search, SearchMode::Off)
++                    && matches!(s.bookmark_mode, BookmarkMode::Off)
+                     && !s.translation_picker
+                     && !s.help_open
+             );
+@@ -285,6 +286,63 @@ impl App {
+                     return;
+                 }
+ 
++                // Bookmark list mode
++                if matches!(state.bookmark_mode, BookmarkMode::Active { .. }) {
++                    match key {
++                        KeyCode::Esc | KeyCode::Char('B') => {
++                            state.bookmark_mode = BookmarkMode::Off;
++                        }
++                        KeyCode::Up | KeyCode::Char('k') => {
++                            if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
++                                let i = list_state.selected().unwrap_or(0);
++                                if i > 0 {
++                                    list_state.select(Some(i - 1));
++                                }
++                            }
++                        }
++                        KeyCode::Down | KeyCode::Char('j') => {
++                            if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
++                                let i = list_state.selected().unwrap_or(0);
++                                if i < state.bookmarks.len().saturating_sub(1) {
++                                    list_state.select(Some(i + 1));
++                                }
++                            }
++                        }
++                        KeyCode::Enter => {
++                            let target = state
++                                .selected_bookmark()
++                                .map(|b| (b.book.clone(), b.chapter, b.verse));
++                            if let Some((book, chapter, verse)) = target {
++                                state.jump_to_result(&book, chapter, verse);
++                                self.load_chapter().await;
++                            }
++                        }
++                        KeyCode::Char('d') => {
++                            if let Some(b) = state.selected_bookmark().cloned() {
++                                crate::store::bookmarks::remove(
++                                    &mut state.bookmarks,
++                                    &b.translation,
++                                    &b.book,
++                                    b.chapter,
++                                    b.verse,
++                                );
++                                crate::store::bookmarks::save(&state.bookmarks);
++                                if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
++                                    let i = list_state.selected().unwrap_or(0);
++                                    list_state.select(Some(
++                                        i.min(state.bookmarks.len().saturating_sub(1)),
++                                    ));
++                                }
++                                if state.bookmarks.is_empty() {
++                                    state.bookmark_mode = BookmarkMode::Off;
++                                }
++                            }
++                        }
++                        _ => {}
++                    }
++                    return;
++                }
++
+                 // Translation picker mode
+                 if state.translation_picker {
+                     match key {
+@@ -368,6 +426,12 @@ impl App {
+                         state.help_open = true;
+                         state.help_scroll = 0;
+                     }
++                    KeyCode::Char('b') => {
++                        self.toggle_bookmark();
++                    }
++                    KeyCode::Char('B') => {
++                        self.open_bookmark_list();
++                    }
+                     KeyCode::Char('y') | KeyCode::Char('c') => {
+                         self.copy_selection(false);
+                     }
+@@ -406,6 +470,42 @@ impl App {
+         }
+     }
+ 
++    /// Toggle a bookmark on the currently selected scripture-panel verse.
++    fn toggle_bookmark(&mut self) {
++        if let AppMode::Browser(ref mut state) = self.mode {
++            let Some((translation, book, chapter, verse, text)) = state.bookmark_target() else {
++                return;
++            };
++            let now_bookmarked = crate::store::bookmarks::toggle(
++                &mut state.bookmarks,
++                &translation,
++                &book,
++                chapter,
++                verse,
++                &text,
++            );
++            crate::store::bookmarks::save(&state.bookmarks);
++            if now_bookmarked {
++                state.flash("Bookmarked");
++            } else {
++                state.flash("Bookmark removed");
++            }
++        }
++    }
++
++    /// Open the bookmark list in place of the scripture panel.
++    fn open_bookmark_list(&mut self) {
++        if let AppMode::Browser(ref mut state) = self.mode {
++            if state.bookmarks.is_empty() {
++                state.flash("No bookmarks yet \u{2014} press b on a verse to add one");
++                return;
++            }
++            let mut list_state = ListState::default();
++            list_state.select(Some(0));
++            state.bookmark_mode = BookmarkMode::Active { list_state };
++        }
++    }
++
+     /// Copy the current selection to the system clipboard: the selected
+     /// verse (or visual range) in verse-per-line view, the whole chapter in
+     /// paragraph view. `visual` (Y) starts a range selection first.
+diff --git a/src/ui/browser.rs b/src/ui/browser.rs
+index 7403ce0..754ed11 100644
+--- a/src/ui/browser.rs
++++ b/src/ui/browser.rs
+@@ -1,5 +1,6 @@
+ use crate::api::types::{Chapter, SearchResult};
+ use crate::data::books::BOOKS;
++use crate::store::bookmarks::Bookmark;
+ use crate::store::cache;
+ use crate::ui::theme::{Theme, ThemeName};
+ use crate::ui::wrap;
+@@ -43,6 +44,12 @@ pub enum SearchMode {
+     },
+ }
+ 
++#[derive(Debug, Clone, PartialEq)]
++pub enum BookmarkMode {
++    Off,
++    Active { list_state: ListState },
++}
++
+ pub struct TranslationInfo {
+     pub code: &'static str,
+     pub name: &'static str,
+@@ -140,6 +147,11 @@ pub struct BrowserState {
+     /// the highlighted target after a short debounce (#7).
+     pub preview_pending: Option<std::time::Instant>,
+     verse_layout: VerseLayoutCache,
++    /// Saved bookmarks, loaded from disk at startup.
++    pub bookmarks: Vec<Bookmark>,
++    /// Whether the bookmark list is currently displayed in place of the
++    /// scripture panel (mirrors `SearchMode`).
++    pub bookmark_mode: BookmarkMode,
+ }
+ 
+ /// How long Books/Chapters browsing must be still before the scripture
+@@ -246,6 +258,8 @@ impl BrowserState {
+             help_scroll: 0,
+             preview_pending: None,
+             verse_layout: VerseLayoutCache::default(),
++            bookmarks: crate::store::bookmarks::load(),
++            bookmark_mode: BookmarkMode::Off,
+         }
+     }
+ 
+@@ -641,6 +655,44 @@ impl BrowserState {
+         }
+     }
+ 
++    /// (translation, book, chapter, verse, verse_text) for the currently
++    /// selected verse in the scripture panel — the target of `b` (toggle
++    /// bookmark) and `n` (edit note). None if no chapter is loaded.
++    pub fn bookmark_target(&self) -> Option<(String, String, u32, u32, String)> {
++        let chapter = self.current_chapter.as_ref()?;
++        if chapter.verses.is_empty() {
++            return None;
++        }
++        let idx = self.selected_verse_idx();
++        let v = chapter.verses.get(idx)?;
++        Some((
++            chapter.translation.clone(),
++            chapter.book.clone(),
++            chapter.chapter,
++            v.verse,
++            v.text.clone(),
++        ))
++    }
++
++    /// Whether the currently selected scripture-panel verse is bookmarked.
++    pub fn current_verse_is_bookmarked(&self) -> bool {
++        match self.bookmark_target() {
++            Some((translation, book, chapter, verse, _text)) => {
++                crate::store::bookmarks::is_bookmarked(&self.bookmarks, &translation, &book, chapter, verse)
++            }
++            None => false,
++        }
++    }
++
++    pub fn selected_bookmark(&self) -> Option<&Bookmark> {
++        if let BookmarkMode::Active { list_state } = &self.bookmark_mode {
++            let idx = list_state.selected()?;
++            self.bookmarks.get(idx)
++        } else {
++            None
++        }
++    }
++
+     /// Navigate to a book and chapter from a search result.
+     pub fn jump_to_result(&mut self, book: &str, chapter: u32, verse: u32) {
+         // Find the book index
+@@ -652,6 +704,7 @@ impl BrowserState {
+             self.scripture_scroll = 0;
+             self.active_panel = Panel::Scripture;
+             self.search = SearchMode::Off;
++            self.bookmark_mode = BookmarkMode::Off;
+             self.highlight_verse = Some(verse);
+             // Approximate until the chapter loads; load_chapter re-resolves
+             // by verse number (translations can have numbering gaps).
+@@ -726,6 +779,9 @@ pub fn render_browser(
+         render_search_results_panel(frame, panels[2], state, theme);
+         render_search_input(frame, main_and_status[1], state, theme);
+         render_status_bar(frame, main_and_status[2], theme, theme_name, &translation, dl, flash.as_deref());
++    } else if matches!(state.bookmark_mode, BookmarkMode::Active { .. }) {
++        render_bookmark_list_panel(frame, panels[2], state, theme);
++        render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
+     } else {
+         render_scripture_panel(frame, panels[2], state, theme);
+         render_status_bar(frame, main_and_status[1], theme, theme_name, &translation, dl, flash.as_deref());
+@@ -768,7 +824,9 @@ fn books_panel_width(state: &BrowserState, total: u16) -> u16 {
+ }
+ 
+ fn render_books_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
+-    let is_active = state.active_panel == Panel::Books && matches!(state.search, SearchMode::Off);
++    let is_active = state.active_panel == Panel::Books
++        && matches!(state.search, SearchMode::Off)
++        && matches!(state.bookmark_mode, BookmarkMode::Off);
+     let block = Block::default()
+         .title(Span::styled(
+             " Books ",
+@@ -808,7 +866,9 @@ fn render_books_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, t
+ }
+ 
+ fn render_chapters_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
+-    let is_active = state.active_panel == Panel::Chapters && matches!(state.search, SearchMode::Off);
++    let is_active = state.active_panel == Panel::Chapters
++        && matches!(state.search, SearchMode::Off)
++        && matches!(state.bookmark_mode, BookmarkMode::Off);
+     let block = Block::default()
+         .title(Span::styled(
+             " Ch ",
+@@ -844,7 +904,9 @@ fn render_chapters_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState
+ }
+ 
+ fn render_scripture_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
+-    let is_active = state.active_panel == Panel::Scripture && matches!(state.search, SearchMode::Off);
++    let is_active = state.active_panel == Panel::Scripture
++        && matches!(state.search, SearchMode::Off)
++        && matches!(state.bookmark_mode, BookmarkMode::Off);
+ 
+     let title = if let Some(ref ch) = state.current_chapter {
+         format!(" {} {} ", state.loaded_book_display_name(ch), ch.chapter)
+@@ -1317,6 +1379,149 @@ fn render_search_results_panel(
+     }
+ }
+ 
++fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
++    let selected_bookmark = state.selected_bookmark().cloned();
++    let list_state = match &mut state.bookmark_mode {
++        BookmarkMode::Active { list_state } => list_state,
++        BookmarkMode::Off => return,
++    };
++    let bookmarks = &state.bookmarks;
++
++    let title = format!(" Bookmarks ({}) ", bookmarks.len());
++    let block = Block::default()
++        .title(Span::styled(title, Style::default().fg(theme.accent).bold()))
++        .borders(Borders::ALL)
++        .border_type(BorderType::Rounded)
++        .border_style(Style::default().fg(theme.border_active))
++        .padding(Padding::horizontal(1))
++        .style(Style::default().bg(theme.surface));
++
++    if bookmarks.is_empty() {
++        let empty = Paragraph::new(vec![
++            Line::default(),
++            Line::default(),
++            Line::from(Span::styled(
++                "No bookmarks yet",
++                Style::default().fg(theme.text_dim),
++            )),
++            Line::default(),
++            Line::from(Span::styled(
++                "Press b on a verse to bookmark it \u{00b7} Esc to go back",
++                Style::default().fg(theme.text_muted),
++            )),
++        ])
++        .block(block)
++        .alignment(Alignment::Center);
++        frame.render_widget(empty, area);
++        return;
++    }
++
++    // Reserve the bottom of the panel for the full text (and note, if any)
++    // of the selected bookmark, sized to its wrapped height.
++    let preview_height = selected_bookmark.as_ref().map_or(0, |b| {
++        let text_w = (area.width as usize).saturating_sub(4).max(10);
++        let note_lines = if b.note.is_some() { 2 } else { 0 };
++        (wrap::wrapped_height(&b.verse_text, text_w) as u16 + note_lines + 2).min(area.height / 2)
++    });
++    let chunks = Layout::vertical([
++        Constraint::Min(3),
++        Constraint::Length(preview_height),
++    ])
++    .split(area);
++
++    // Same windowing approach as the search results panel (#12 follow-up):
++    // only build ListItems for the rows actually on screen.
++    let total = bookmarks.len();
++    let list_area_height = chunks[0].height.saturating_sub(2) as usize;
++    let selected = list_state.selected();
++
++    let mut offset = list_state.offset();
++    if let Some(sel) = selected {
++        if sel < offset {
++            offset = sel;
++        } else if list_area_height > 0 && sel >= offset + list_area_height {
++            offset = sel - list_area_height + 1;
++        }
++    }
++    let max_offset = total.saturating_sub(list_area_height);
++    offset = offset.min(max_offset);
++    *list_state.offset_mut() = offset;
++
++    let visible_end = (offset + list_area_height).min(total);
++    let visible_bookmarks = &bookmarks[offset..visible_end];
++
++    let items: Vec<ListItem> = visible_bookmarks
++        .iter()
++        .enumerate()
++        .map(|(i, b)| {
++            let global_i = offset + i;
++            let is_selected = Some(global_i) == selected;
++            let ref_style = if is_selected {
++                Style::default()
++                    .fg(theme.accent)
++                    .bg(theme.highlight_bg)
++                    .add_modifier(Modifier::BOLD)
++            } else {
++                Style::default().fg(theme.accent_soft).bold()
++            };
++            let text_style = if is_selected {
++                Style::default().fg(theme.text).bg(theme.highlight_bg)
++            } else {
++                Style::default().fg(theme.text_dim)
++            };
++
++            let ref_str = format!("{} {}:{}", b.book, b.chapter, b.verse);
++            let note_marker = if b.note.is_some() { " \u{1f4dd}" } else { "" };
++            let chrome = 6 + UnicodeWidthStr::width(ref_str.as_str()) + note_marker.len();
++            let max_chars = (chunks[0].width as usize).saturating_sub(chrome).max(20);
++            let text = truncate_result_text(&b.verse_text, max_chars);
++
++            let spans = vec![
++                Span::styled(ref_str, ref_style),
++                Span::styled(note_marker, ref_style),
++                Span::styled("  ", text_style),
++                Span::styled(text, text_style),
++            ];
++
++            ListItem::new(Line::from(spans))
++        })
++        .collect();
++
++    let list = List::new(items).block(block).highlight_symbol("  ");
++    let mut render_state = ListState::default();
++    if let Some(sel) = selected {
++        render_state.select(Some(sel.saturating_sub(offset)));
++    }
++    frame.render_stateful_widget(list, chunks[0], &mut render_state);
++
++    if let Some(b) = selected_bookmark {
++        if chunks[1].height >= 3 {
++            let preview_title = format!(" {} {}:{} \u{00b7} {} ", b.book, b.chapter, b.verse, b.translation);
++            let preview_block = Block::default()
++                .title(Span::styled(preview_title, Style::default().fg(theme.accent).bold()))
++                .borders(Borders::ALL)
++                .border_type(BorderType::Rounded)
++                .border_style(Style::default().fg(theme.border))
++                .padding(Padding::horizontal(1))
++                .style(Style::default().bg(theme.surface));
++
++            let mut lines = vec![Line::from(Span::styled(
++                b.verse_text.clone(),
++                Style::default().fg(theme.text),
++            ))];
++            if let Some(note) = &b.note {
++                lines.push(Line::default());
++                lines.push(Line::from(vec![
++                    Span::styled("Note: ", Style::default().fg(theme.accent_soft).bold()),
++                    Span::styled(note.clone(), Style::default().fg(theme.text_dim)),
++                ]));
++            }
++            let preview = Paragraph::new(lines).block(preview_block).wrap(Wrap { trim: false });
++            frame.render_widget(preview, chunks[1]);
++        }
++    }
++}
++
+ fn render_search_input(frame: &mut Frame, area: Rect, state: &BrowserState, theme: &Theme) {
+     let query = match &state.search {
+         SearchMode::Active { query, .. } => query.as_str(),
+@@ -1371,6 +1576,7 @@ fn render_status_bar(
+             ("\u{2190}\u{2192}/hl", "panels"),
+             ("\u{2191}\u{2193}/jk", "navigate"),
+             ("/", "search"),
++            ("b", "bookmark"),
+             ("y/Y", "copy"),
+             ("p", "view"),
+             ("t", theme_name.label()),
+@@ -1568,6 +1774,12 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &mut BrowserState, th
+         key_line("Enter", "jump to the selected verse"),
+         key_line("Esc", "close search"),
+         Line::default(),
++        section("Bookmarks"),
++        key_line("b", "bookmark / un-bookmark the selected verse"),
++        key_line("B", "open your bookmark list"),
++        key_line("Enter", "jump to the selected bookmark"),
++        key_line("d", "delete the selected bookmark"),
++        Line::default(),
+         section("Settings"),
+         key_line("t", "cycle themes"),
+         key_line("v", "choose translation (Enter applies)"),
+@@ -1668,6 +1880,10 @@ mod tests {
+ 
+     fn state_at(book_idx: usize, chapter: u32, scroll: u16) -> BrowserState {
+         let mut s = BrowserState::new();
++        // BrowserState::new() loads real bookmarks from disk — reset so
++        // tests never depend on what happens to be saved on the machine
++        // running them.
++        s.bookmarks = Vec::new();
+         s.selected_book_idx = book_idx;
+         s.book_list.select(Some(book_idx));
+         s.selected_chapter = chapter;
+@@ -1967,4 +2183,61 @@ mod tests {
+         assert_eq!(books_panel_width(&s, 60), 20);
+         assert_eq!(books_panel_width(&s, 20), 12, "floor for tiny sizes");
+     }
++
++    #[test]
++    fn bookmark_target_reads_the_selected_verse() {
++        let mut s = state_at(0, 1, 0); // Genesis 1, stub verses 1-3
++        s.verse_list.select(Some(1)); // verse 2
++        let (translation, book, chapter, verse, text) = s.bookmark_target().unwrap();
++        assert_eq!(translation, "KJV");
++        assert_eq!(book, "Genesis");
++        assert_eq!(chapter, 1);
++        assert_eq!(verse, 2);
++        assert_eq!(text, "stub 2");
++    }
++
++    #[test]
++    fn bookmark_target_is_none_without_a_loaded_chapter() {
++        let s = BrowserState::new();
++        assert!(s.bookmark_target().is_none());
++    }
++
++    #[test]
++    fn current_verse_is_bookmarked_reflects_the_bookmarks_list() {
++        let mut s = state_at(0, 1, 0);
++        s.verse_list.select(Some(0)); // verse 1
++        assert!(!s.current_verse_is_bookmarked());
++
++        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
++        assert!(s.current_verse_is_bookmarked());
++
++        // A different verse in the same chapter is unaffected.
++        s.verse_list.select(Some(1)); // verse 2
++        assert!(!s.current_verse_is_bookmarked());
++    }
++
++    #[test]
++    fn selected_bookmark_tracks_the_bookmark_list_cursor() {
++        let mut s = state_at(0, 1, 0);
++        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
++        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2");
++
++        assert!(s.selected_bookmark().is_none(), "no cursor while bookmark_mode is Off");
++
++        let mut list_state = ListState::default();
++        list_state.select(Some(1));
++        s.bookmark_mode = BookmarkMode::Active { list_state };
++        assert_eq!(s.selected_bookmark().unwrap().verse, 2);
++    }
++
++    #[test]
++    fn jump_to_result_closes_the_bookmark_list() {
++        let mut s = state_at(0, 1, 0);
++        let mut list_state = ListState::default();
++        list_state.select(Some(0));
++        s.bookmark_mode = BookmarkMode::Active { list_state };
++
++        s.jump_to_result("Exodus", 2, 3);
++        assert_eq!(s.bookmark_mode, BookmarkMode::Off);
++    }
+ }
