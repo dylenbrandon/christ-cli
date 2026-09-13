@@ -175,6 +175,10 @@ pub struct BrowserState {
     pub compare_error: Option<String>,
     pub compare_picker: bool,
     pub compare_translation_list: ListState,
+    /// Remembers the last translation compared against, even after
+    /// closing compare mode, so reopening the picker defaults to it
+    /// instead of falling back to the primary translation.
+    pub last_compare_translation: Option<String>,
 }
 
 /// How long Books/Chapters browsing must be still before the scripture
@@ -290,6 +294,7 @@ impl BrowserState {
             compare_error: None,
             compare_picker: false,
             compare_translation_list: ListState::default(),
+            last_compare_translation: None,
         }
     }
 
@@ -317,6 +322,7 @@ impl BrowserState {
             _ => ViewMode::VersePerLine,
         };
         self.verse_list.select(Some(saved.selected_verse as usize));
+        self.last_compare_translation = saved.last_compare_translation.clone();
     }
 
     /// Snapshot current state for persistence.
@@ -336,6 +342,7 @@ impl BrowserState {
                 ViewMode::Paragraph => 1,
             },
             selected_verse: self.verse_list.selected().unwrap_or(0) as u32,
+            last_compare_translation: self.last_compare_translation.clone(),
             ..Default::default()
         }
     }
@@ -756,7 +763,11 @@ impl BrowserState {
     }
 
     pub fn open_compare_picker(&mut self) {
-        let current = self.compare_translation.as_deref().unwrap_or(&self.translation);
+        let current = self
+            .compare_translation
+            .as_deref()
+            .or(self.last_compare_translation.as_deref())
+            .unwrap_or(&self.translation);
         let current_idx = TRANSLATIONS
             .iter()
             .position(|t| t.code.eq_ignore_ascii_case(current))
@@ -770,7 +781,9 @@ impl BrowserState {
     /// only makes sense with per-verse rows.
     pub fn pick_compare_translation(&mut self) {
         let idx = self.compare_translation_list.selected().unwrap_or(0);
-        self.compare_translation = Some(TRANSLATIONS[idx].code.to_string());
+        let code = TRANSLATIONS[idx].code.to_string();
+        self.compare_translation = Some(code.clone());
+        self.last_compare_translation = Some(code);
         self.compare_picker = false;
         self.view_mode = ViewMode::VersePerLine;
     }
@@ -2743,5 +2756,46 @@ mod tests {
         assert!(!s.compare_loading);
         assert!(s.compare_error.is_none());
         assert!(!s.compare_picker);
+    }
+
+    #[test]
+    fn reopening_compare_picker_defaults_to_last_used_translation() {
+        let mut s = state_at(0, 1, 0);
+        s.translation = "KJV".to_string();
+
+        // Pick ESV, then close compare mode entirely.
+        s.open_compare_picker();
+        let esv_idx = TRANSLATIONS.iter().position(|t| t.code == "ESV").unwrap();
+        s.compare_translation_list.select(Some(esv_idx));
+        s.pick_compare_translation();
+        s.close_compare();
+        assert!(s.compare_translation.is_none(), "compare mode is off");
+
+        // Reopening should highlight ESV again, not fall back to KJV.
+        s.open_compare_picker();
+        let idx = s.compare_translation_list.selected().unwrap();
+        assert_eq!(TRANSLATIONS[idx].code, "ESV");
+    }
+
+    #[test]
+    fn last_compare_translation_round_trips_through_snapshot_and_restore() {
+        let mut s = state_at(0, 1, 0);
+        s.open_compare_picker();
+        let niv_idx = TRANSLATIONS.iter().position(|t| t.code == "NIV").unwrap();
+        s.compare_translation_list.select(Some(niv_idx));
+        s.pick_compare_translation();
+        s.close_compare();
+
+        let saved = s.snapshot();
+        assert_eq!(saved.last_compare_translation.as_deref(), Some("NIV"));
+
+        // Simulate a fresh launch restoring that saved session.
+        let mut fresh = BrowserState::new();
+        fresh.restore(&saved);
+        assert_eq!(fresh.last_compare_translation.as_deref(), Some("NIV"));
+
+        fresh.open_compare_picker();
+        let idx = fresh.compare_translation_list.selected().unwrap();
+        assert_eq!(TRANSLATIONS[idx].code, "NIV");
     }
 }

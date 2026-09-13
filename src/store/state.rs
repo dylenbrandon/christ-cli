@@ -22,6 +22,10 @@ pub struct SessionState {
     /// true after any completed session. `christ intro` replays it.
     #[serde(default)]
     pub banner_shown: bool,
+    /// Last translation used for side-by-side comparison (Shift+V), so
+    /// reopening the picker in a future session defaults to it.
+    #[serde(default)]
+    pub last_compare_translation: Option<String>,
 }
 
 impl Default for SessionState {
@@ -36,6 +40,7 @@ impl Default for SessionState {
             view_mode: 0,
             selected_verse: 0,
             banner_shown: false,
+            last_compare_translation: None,
         }
     }
 }
@@ -100,5 +105,15 @@ mod tests {
         assert_eq!(state.translation, "KJV");
         assert_eq!(state.chapter, 1);
         assert_eq!(state.book_index, 0);
+    }
+
+    #[test]
+    fn legacy_state_without_last_compare_translation_deserializes() {
+        // Same class of pitfall as banner_shown above: session files saved
+        // before this field existed must still load, defaulting to no
+        // remembered compare translation rather than failing to parse.
+        let legacy = r#"{"book_index":0,"chapter":1,"scroll_position":0,"active_panel":2}"#;
+        let state: SessionState = serde_json::from_str(legacy).unwrap();
+        assert!(state.last_compare_translation.is_none());
     }
 }
