@@ -86,31 +86,38 @@ When you run `christ` with no arguments, it launches a full-screen terminal brow
 - **Left/Right arrows / h l** - switch between panels (Books, Chapters, Scripture)
 - **Up/Down arrows / j k** - navigate within a panel (moves the verse cursor in the Scripture panel); the Scripture panel live-previews the highlighted book or chapter as you browse
 - **Enter** - select a book or chapter
-- **/** - live search the Bible (full text of the selected result shows in a preview pane)
+- **/** - live search the Bible — every match, in book order, with a full-text preview pane
+- **b** - bookmark (or un-bookmark) the selected verse
+- **B** - open your bookmark list; **Enter** jumps to a bookmark, **d** deletes it
+- **n** - add or edit a note on the selected verse or bookmark
 - **y** (or **c**) - copy the selected verse to the clipboard
 - **Y** (or **C**) - start a verse-range selection; move with j/k, then **Y** copies it (**Esc** cancels)
 - **p** - toggle between verse-per-line and paragraph reading view (in paragraph view, **y** copies the whole chapter)
 - **t** - cycle themes (Slate, Midnight, Parchment, Gospel, Terminal)
 - **v** - pick a translation
+- **Shift+V** - compare a second translation side by side (read-only); pick from the same list, **Shift+V** again turns it off
 - **?** - help overlay with every keybinding and its variations
 - **qq** - quit (press q twice)
 
-Your reading position, view mode, and theme are saved automatically.
+Your reading position, view mode, theme, bookmarks, and last-used comparison
+translation are saved automatically.
 
 ## Features
 
 - Full-screen TUI with 3-panel browser (Books | Chapters | Scripture)
 - Verse-per-line or paragraph reading view, with a verse cursor
+- Bookmarks with notes — mark verses, attach a note, browse and jump back from a dedicated list
+- Side-by-side translation comparison — read two translations of the same passage at once, read-only reference column stays in sync as you scroll
 - Copy verses, ranges, or chapters to the system clipboard (native + OSC 52, so it works over SSH)
 - Animated startup banner
-- Live search with instant results as you type and a full-text preview
+- Live search: every match, in canonical book order, with a full-text preview — no result cap
 - Themes: Slate (dark), Midnight (shadcn/Vercel dark), Parchment (warm light), Gospel (bright white), Terminal (transparent)
 - Bundled KJV Bible (works 100% offline, no internet required)
-- Online API fallback for 50+ other translations via Bolls.life
+- Online API fallback for 50+ other translations via Bolls.life, including MEV, NIV, ESV, NASB, and more
 - Forgiving reference parser (jn 3:16, 1cor 13, Ps 23:1-6, João 3.16, 1. Mose 3,16 all work)
 - Book names understood in 12 languages
 - Pipe-friendly (plain text when piped, rich TUI when interactive)
-- Session persistence (remembers where you left off)
+- Session persistence (remembers where you left off, your bookmarks, and your last comparison translation)
 
 ## Tech
 
