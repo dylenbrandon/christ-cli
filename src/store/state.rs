@@ -22,7 +22,7 @@ pub struct SessionState {
     /// true after any completed session. `christ intro` replays it.
     #[serde(default)]
     pub banner_shown: bool,
-    /// Last translation used for side-by-side comparison (Shift+V), so
+    /// Last translation used for side-by-side comparison (V), so
     /// reopening the picker in a future session defaults to it.
     #[serde(default)]
     pub last_compare_translation: Option<String>,

@@ -95,7 +95,7 @@ When you run `christ` with no arguments, it launches a full-screen terminal brow
 - **p** - toggle between verse-per-line and paragraph reading view (in paragraph view, **y** copies the whole chapter)
 - **t** - cycle themes (Slate, Midnight, Parchment, Gospel, Terminal)
 - **v** - pick a translation
-- **Shift+V** - compare a second translation side by side (read-only); pick from the same list, **Shift+V** again turns it off
+- **V** - compare a second translation side by side (read-only); pick from the same list, **V** again turns it off
 - **?** - help overlay with every keybinding and its variations
 - **qq** - quit (press q twice)
 

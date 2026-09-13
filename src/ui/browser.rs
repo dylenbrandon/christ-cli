@@ -1120,7 +1120,7 @@ fn render_scripture_panel(frame: &mut Frame, area: Rect, state: &mut BrowserStat
 }
 
 /// Read-only column showing a second translation alongside the primary
-/// scripture panel (Shift+V). Deliberately simpler than `render_verse_list`
+/// scripture panel (V). Deliberately simpler than `render_verse_list`
 /// — no selection cursor, no bookmark marker, no wrap cache — since this
 /// column doesn't support any interaction of its own; it just follows the
 /// primary column's selected verse to stay roughly in sync while scrolling.
@@ -1843,6 +1843,7 @@ fn render_status_bar(
             ("p", "view"),
             ("t", theme_name.label()),
             ("v", translation),
+            ("V", "compare"),
             ("?", "help"),
             ("qq", "quit"),
         ];
@@ -1901,7 +1902,7 @@ fn truncate_display_name(name: &str, max_width: usize) -> String {
     truncated
 }
 
-/// Picker for the second (compare) translation, opened with Shift+V.
+/// Picker for the second (compare) translation, opened with V.
 /// Adapted from `render_translation_picker` — same layout, but tracks
 /// `compare_translation_list`/`compare_translation` instead of the
 /// primary translation picker's state.
@@ -2190,7 +2191,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &mut BrowserState, th
         section("Settings"),
         key_line("t", "cycle themes"),
         key_line("v", "choose translation (Enter applies)"),
-        key_line("Shift+V", "compare a second translation side by side (read-only)"),
+        key_line("V", "compare a second translation side by side (read-only)"),
         Line::default(),
         section("Other"),
         key_line("?", "toggle this help"),
