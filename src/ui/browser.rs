@@ -2098,11 +2098,25 @@ fn render_translation_picker(
 fn render_note_editor(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
     let Some(editor) = &state.note_editor else { return };
 
-    let verse_text_w = 50usize;
-    let verse_preview = truncate_result_text(&editor.verse_text, verse_text_w);
+    let popup_width = 60u16;
+    let inner_text_w = (popup_width as usize).saturating_sub(4).max(10); // 2 border cols + 2 padding cols
 
-    let popup_width = 56u16;
-    let popup_height = 8u16.min(area.height.saturating_sub(4));
+    let verse_preview = truncate_result_text(&editor.verse_text, inner_text_w);
+
+    // The input line wraps as the draft grows ("> " prefix + draft text +
+    // a trailing cursor block), so the popup's height needs to grow with
+    // it — a fixed height just clipped anything past a short sentence.
+    // Wrapping the exact rendered text (rather than estimating from the
+    // draft alone) keeps this in sync with what the Paragraph below
+    // actually draws — same approach used for bookmark preview sizing.
+    let input_preview = format!("> {}\u{2588}", editor.draft);
+    let input_h = wrap::wrapped_height(&input_preview, inner_text_w).max(1);
+
+    // verse line + blank + input lines + blank + hint line, plus borders.
+    let interior_h = 4 + input_h;
+    let popup_height = (interior_h as u16 + 2)
+        .max(8) // never smaller than the original fixed size
+        .min(area.height.saturating_sub(4));
 
     let horizontal = Layout::horizontal([Constraint::Length(popup_width)])
         .flex(Flex::Center)
