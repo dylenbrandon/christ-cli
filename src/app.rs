@@ -332,7 +332,7 @@ impl App {
                 // Bookmark list mode
                 if matches!(state.bookmark_mode, BookmarkMode::Active { .. }) {
                     match key {
-                        KeyCode::Esc | KeyCode::Char('B') => {
+                        KeyCode::Esc | KeyCode::Char('B') | KeyCode::Char('N') => {
                             state.bookmark_mode = BookmarkMode::Off;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -344,9 +344,10 @@ impl App {
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
+                            let visible_len = state.visible_bookmarks().len();
                             if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
                                 let i = list_state.selected().unwrap_or(0);
-                                if i < state.bookmarks.len().saturating_sub(1) {
+                                if i < visible_len.saturating_sub(1) {
                                     list_state.select(Some(i + 1));
                                 }
                             }
@@ -361,7 +362,7 @@ impl App {
                             }
                         }
                         KeyCode::Char('d') => {
-                            if let Some(b) = state.selected_bookmark().cloned() {
+                            if let Some(b) = state.selected_bookmark() {
                                 crate::store::bookmarks::remove(
                                     &mut state.bookmarks,
                                     &b.translation,
@@ -370,19 +371,18 @@ impl App {
                                     b.verse,
                                 );
                                 crate::store::bookmarks::save(&state.bookmarks);
+                                let visible_len = state.visible_bookmarks().len();
                                 if let BookmarkMode::Active { list_state } = &mut state.bookmark_mode {
                                     let i = list_state.selected().unwrap_or(0);
-                                    list_state.select(Some(
-                                        i.min(state.bookmarks.len().saturating_sub(1)),
-                                    ));
+                                    list_state.select(Some(i.min(visible_len.saturating_sub(1))));
                                 }
-                                if state.bookmarks.is_empty() {
+                                if visible_len == 0 {
                                     state.bookmark_mode = BookmarkMode::Off;
                                 }
                             }
                         }
                         KeyCode::Char('n') => {
-                            if let Some(b) = state.selected_bookmark().cloned() {
+                            if let Some(b) = state.selected_bookmark() {
                                 state.open_note_editor(
                                     b.translation,
                                     b.book,
@@ -516,6 +516,9 @@ impl App {
                     KeyCode::Char('n') => {
                         self.open_note_for_current_verse();
                     }
+                    KeyCode::Char('N') => {
+                        self.open_notes_list();
+                    }
                     KeyCode::Char('V') => {
                         self.toggle_compare();
                     }
@@ -604,8 +607,24 @@ impl App {
     /// Open the bookmark list in place of the scripture panel.
     fn open_bookmark_list(&mut self) {
         if let AppMode::Browser(ref mut state) = self.mode {
+            state.notes_only = false;
             if state.bookmarks.is_empty() {
                 state.flash("No bookmarks yet \u{2014} press b on a verse to add one");
+                return;
+            }
+            let mut list_state = ListState::default();
+            list_state.select(Some(0));
+            state.bookmark_mode = BookmarkMode::Active { list_state };
+        }
+    }
+
+    /// Open the bookmark list filtered to only bookmarks with a note
+    /// attached, in place of the scripture panel.
+    fn open_notes_list(&mut self) {
+        if let AppMode::Browser(ref mut state) = self.mode {
+            state.notes_only = true;
+            if state.visible_bookmarks().is_empty() {
+                state.flash("No notes yet \u{2014} press n on a verse to add one");
                 return;
             }
             let mut list_state = ListState::default();

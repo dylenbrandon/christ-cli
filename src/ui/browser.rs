@@ -165,6 +165,10 @@ pub struct BrowserState {
     /// Whether the bookmark list is currently displayed in place of the
     /// scripture panel (mirrors `SearchMode`).
     pub bookmark_mode: BookmarkMode,
+    /// When the bookmark list is open, whether it's filtered to only
+    /// bookmarks that have a note attached (opened with `N`) or showing
+    /// everything (opened with `B`).
+    pub notes_only: bool,
     /// Open while the note-entry overlay is active; None otherwise.
     pub note_editor: Option<NoteEditor>,
     /// Side-by-side comparison: Some(code) when active, showing this
@@ -287,6 +291,7 @@ impl BrowserState {
             verse_layout: VerseLayoutCache::default(),
             bookmarks: crate::store::bookmarks::load(),
             bookmark_mode: BookmarkMode::Off,
+            notes_only: false,
             note_editor: None,
             compare_translation: None,
             compare_chapter: None,
@@ -721,10 +726,26 @@ impl BrowserState {
         }
     }
 
-    pub fn selected_bookmark(&self) -> Option<&Bookmark> {
+    /// A filtered, owned snapshot of the bookmark list: either everything,
+    /// or only bookmarks with a note attached, depending on `notes_only`.
+    /// Returning owned `Bookmark`s (they're small) sidesteps lifetime
+    /// issues from returning references into a freshly-filtered view.
+    pub fn visible_bookmarks(&self) -> Vec<Bookmark> {
+        if self.notes_only {
+            self.bookmarks
+                .iter()
+                .filter(|b| b.note.is_some())
+                .cloned()
+                .collect()
+        } else {
+            self.bookmarks.clone()
+        }
+    }
+
+    pub fn selected_bookmark(&self) -> Option<Bookmark> {
         if let BookmarkMode::Active { list_state } = &self.bookmark_mode {
             let idx = list_state.selected()?;
-            self.bookmarks.get(idx)
+            self.visible_bookmarks().into_iter().nth(idx)
         } else {
             None
         }
@@ -1642,14 +1663,22 @@ fn render_search_results_panel(
 }
 
 fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut BrowserState, theme: &Theme) {
-    let selected_bookmark = state.selected_bookmark().cloned();
+    let selected_bookmark = state.selected_bookmark();
+    let notes_only = state.notes_only;
+    // Computed before `list_state` below, since that takes a mutable
+    // borrow of `state.bookmark_mode` — this owned Vec is fully detached
+    // from `state` by the time that borrow starts, so there's no conflict.
+    let bookmarks = state.visible_bookmarks();
     let list_state = match &mut state.bookmark_mode {
         BookmarkMode::Active { list_state } => list_state,
         BookmarkMode::Off => return,
     };
-    let bookmarks = &state.bookmarks;
 
-    let title = format!(" Bookmarks ({}) ", bookmarks.len());
+    let title = format!(
+        " {} ({}) ",
+        if notes_only { "Notes" } else { "Bookmarks" },
+        bookmarks.len()
+    );
     let block = Block::default()
         .title(Span::styled(title, Style::default().fg(theme.accent).bold()))
         .borders(Borders::ALL)
@@ -1659,18 +1688,17 @@ fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut Browser
         .style(Style::default().bg(theme.surface));
 
     if bookmarks.is_empty() {
+        let (empty_label, hint) = if notes_only {
+            ("No notes yet", "Press n on a verse to add one \u{00b7} Esc to go back")
+        } else {
+            ("No bookmarks yet", "Press b on a verse to bookmark it \u{00b7} Esc to go back")
+        };
         let empty = Paragraph::new(vec![
             Line::default(),
             Line::default(),
-            Line::from(Span::styled(
-                "No bookmarks yet",
-                Style::default().fg(theme.text_dim),
-            )),
+            Line::from(Span::styled(empty_label, Style::default().fg(theme.text_dim))),
             Line::default(),
-            Line::from(Span::styled(
-                "Press b on a verse to bookmark it \u{00b7} Esc to go back",
-                Style::default().fg(theme.text_muted),
-            )),
+            Line::from(Span::styled(hint, Style::default().fg(theme.text_muted))),
         ])
         .block(block)
         .alignment(Alignment::Center);
@@ -1679,11 +1707,17 @@ fn render_bookmark_list_panel(frame: &mut Frame, area: Rect, state: &mut Browser
     }
 
     // Reserve the bottom of the panel for the full text (and note, if any)
-    // of the selected bookmark, sized to its wrapped height.
+    // of the selected bookmark, sized to its actual wrapped height rather
+    // than assuming the note is always a single line — a longer note was
+    // getting clipped since only 1 fixed row was ever budgeted for it.
     let preview_height = selected_bookmark.as_ref().map_or(0, |b| {
         let text_w = (area.width as usize).saturating_sub(4).max(10);
-        let note_lines = if b.note.is_some() { 2 } else { 0 };
-        (wrap::wrapped_height(&b.verse_text, text_w) as u16 + note_lines + 2).min(area.height / 2)
+        let verse_h = wrap::wrapped_height(&b.verse_text, text_w) as u16;
+        let note_h = b.note.as_ref().map_or(0, |n| {
+            let note_line = format!("Note: {}", n);
+            1 + wrap::wrapped_height(&note_line, text_w) as u16 // +1 for the blank separator line
+        });
+        (verse_h + note_h + 2).min(area.height / 2)
     });
     let chunks = Layout::vertical([
         Constraint::Min(3),
@@ -2199,6 +2233,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &mut BrowserState, th
         key_line("b", "bookmark / un-bookmark the selected verse"),
         key_line("B", "open your bookmark list"),
         key_line("n", "add / edit a note on the selected verse or bookmark"),
+        key_line("N", "open only the bookmarks that have a note"),
         key_line("Enter", "jump to the selected bookmark"),
         key_line("d", "delete the selected bookmark"),
         Line::default(),
@@ -2660,6 +2695,52 @@ mod tests {
         let mut list_state = ListState::default();
         list_state.select(Some(1));
         s.bookmark_mode = BookmarkMode::Active { list_state };
+        assert_eq!(s.selected_bookmark().unwrap().verse, 2);
+    }
+
+    #[test]
+    fn visible_bookmarks_returns_everything_when_not_notes_only() {
+        let mut s = state_at(0, 1, 0);
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2");
+        crate::store::bookmarks::set_note(
+            &mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2", Some("noted".to_string()),
+        );
+
+        assert!(!s.notes_only);
+        assert_eq!(s.visible_bookmarks().len(), 2);
+    }
+
+    #[test]
+    fn visible_bookmarks_filters_to_notes_only_when_set() {
+        let mut s = state_at(0, 1, 0);
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2");
+        crate::store::bookmarks::set_note(
+            &mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2", Some("noted".to_string()),
+        );
+
+        s.notes_only = true;
+        let visible = s.visible_bookmarks();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].verse, 2);
+    }
+
+    #[test]
+    fn selected_bookmark_indexes_into_the_filtered_list_when_notes_only() {
+        let mut s = state_at(0, 1, 0);
+        // Verse 1 has no note; verse 2 does. With notes_only set, index 0
+        // in the (filtered) list should resolve to verse 2, not verse 1.
+        crate::store::bookmarks::add(&mut s.bookmarks, "KJV", "Genesis", 1, 1, "stub 1");
+        crate::store::bookmarks::set_note(
+            &mut s.bookmarks, "KJV", "Genesis", 1, 2, "stub 2", Some("noted".to_string()),
+        );
+        s.notes_only = true;
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        s.bookmark_mode = BookmarkMode::Active { list_state };
+
         assert_eq!(s.selected_bookmark().unwrap().verse, 2);
     }
 
